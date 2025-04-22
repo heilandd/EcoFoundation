@@ -1,0 +1,1035 @@
+---
+title: "Pipeline Visium Processing"
+output: html_document
+date: "2025-04-17"
+editor_options: 
+  chunk_output_type: console
+  markdown: 
+    wrap: 72
+---
+
+This script should provide a overview of the sample processing in
+python. I have written addition bash scripts for automated and fast
+samples processing. Here we start with Visium data from a adata format.
+The processing can be done from SPATA2 as well squidpy or scanpy as a
+input point. I start with the count matrix and spatial information in
+the adata.uns. Here it is important to notice that if you aum to run
+multiple samples in the same experiment, you should run the
+normalisation in scVI with the defined samples batches. If you run only
+a single sample you dont need the batch normalisation (but potentially
+at later stage...).
+
+The pipeline will contain the following steps:
+
+1.  Adata input and preprocessing
+
+2.  scVI normalisation and Cell2Location
+
+3.  CytoSpce deconvolution
+
+4.  Graph annotation
+
+5.  Pytorch implementation (PYG outputs)
+
+6.  GNN Training (model selection etc.)
+
+7.  Prediction and interpretation
+
+8.  PYG 2 single-cell graph plots
+
+## Requirments:
+
+I use a conda environment calles EcoFoundation which has the requirments
+in the EcoFoundation.yaml file and the environment C2L c2l.yaml as well
+as the environment cytospace cytospace.yaml. Unfortunatly, the pipeline
+is not able to run in a single conda envioronment. In R software SPATA2
+2.04 was used. All functions and required scripts are stored in the
+EcoFoundation github:
+
+# Load data and Create SPATA2 and adata object:
+
+## Load packages
+
+```{r}
+reticulate::use_condaenv("EcoFoundation")
+#reticulate::use_condaenv("c2l")
+## Load Library
+library(DeepSPATA)
+library(SPATA2)
+library(Seurat)
+library(reticulate)
+library(tidyverse)
+library(igraph)
+library(kableExtra)
+library(igraph)
+library(readxl)
+library(anndata)
+
+```
+
+## Load source files
+
+```{r}
+source("/Users/henrikheiland/Desktop/RecurrentGBM/SingleCellRef/import.R")
+
+## Import colors
+pycolors <- importPyColors()
+
+```
+
+## Set up file system
+
+```{r}
+# Set a root:
+root = "/Users/henrikheiland/Desktop/Cooperations/AQP4/Spatial"
+file_system <- readRDS(paste0(root, "/file_system.RDS"))
+
+## Define the outs folder loacations:
+outs_folder = paste0(dir(root, full.names = T), "/outs")
+## Define sample names
+samples=paste0("sample_", dir(root, full.names = F))
+
+## Define data.frame for file system:
+
+file_system=data.frame(samples=samples,
+                       outs = outs_folder,
+                       SPATA = paste0(root,"/", samples, ".RDS"),
+                       adata = paste0(root,"/", samples, ".h5ad"))
+
+
+#saveRDS(file_system, paste0(root, "/file_system.RDS"))
+
+```
+
+## Initiate objects
+
+```{r}
+
+## Loop the files and return objects:
+for(i in 1:nrow(file_system)){
+  
+  spata = SPATA2::initiateSpataObject_10X(file_system$outs[i], sample_name = file_system$samples[i])
+  adata = SPATA2ANDATA(spata)
+  
+  ## Store
+  saveRDS(spata, file_system$SPATA[i])
+  anndata::write_h5ad(adata, filename = file_system$adata[i])
+  
+}
+
+```
+
+## Initialize the C2L runs
+
+For the spatial deconv. we need the optimal type of cells. Here we use
+the single cell data files from the same conditions:
+
+```{r}
+## Set up the input reference single cell data
+seurat = readRDS("/Users/henrikheiland/Desktop/Cooperations/AQP4/SingleCell/integrated_new.RDS")
+DimPlot(seurat, group.by = "celtype_level1", label=T)
+adata_sc = anndata::read_h5ad("/Users/henrikheiland/Desktop/Cooperations/AQP4/SingleCell/integrated_data_new.h5ad")
+
+## We define "batch" as the batch variable. Make sure that this exitsts in you data:
+adata_sc$obs["batch"]
+adata_sc$obs["celltype"] = as.character(seurat$celtype_level1)
+anndata::write_h5ad(adata_sc, filename = "/Users/henrikheiland/Desktop/Cooperations/AQP4/SingleCell/integrated_data_new.h5ad")
+
+## Here are my bash: 
+# cd /Users/henrikheiland/Desktop/MERFISH/EcoFoundation/R_Functions/bash_Script
+#./run_cell2location_sc.sh /Users/henrikheiland/Desktop/Cooperations/AQP4/SingleCell/Cell2Location /Users/henrikheiland/Desktop/Cooperations/AQP4/SingleCell/integrated_data_new.h5ad
+```
+
+## Run Cell 2 location deconvolution:
+
+In the next step we can run cell to location on all files
+
+```{python}
+import subprocess
+adatas = r.file_system.adata.values
+sample = r.file_system.samples.values
+#Usage: Cell2location.sh <AD_FILE> <INF_CSV> <OUTPUT_CSV> [MAXEPOCHS]
+
+# loop through all adata files
+for i, adata_file in enumerate(adatas):
+    infer_csv = "/Users/henrikheiland/Desktop/Cooperations/AQP4/SingleCell/Cell2Location/reference_signatures/infer.csv"
+    output_csv = f'{r.root}/{sample[i]}_decov.csv'
+    max_epochs = "100"
+
+    cmd = [
+        "bash",
+        "/Users/henrikheiland/Desktop/MERFISH/EcoFoundation/R_Functions/bash_Script/Cell2location.sh",
+        adata_file,
+        infer_csv,
+        output_csv,
+        max_epochs ]
+
+    print("Running:", " ".join(cmd))
+    subprocess.run(cmd)
+
+
+```
+
+## Plot Cell2Location plots
+
+If you want to plot the cell2location plots you need to change the
+connected conda to cell2loc:
+
+```{r}
+reticulate::use_condaenv("c2l_old")
+reticulate::use_python("/Users/henrikheiland/miniconda/envs/c2l/bin/python")
+root = "/Users/henrikheiland/Desktop/Cooperations/AQP4/Spatial"
+file_system <- readRDS(paste0(root, "/file_system.RDS"))
+```
+
+Jump to python:
+
+```{python}
+import scanpy as sc
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+import cell2location
+from cell2location.plt import plot_spatial
+
+## load files:
+adatas = r.file_system.adata.values
+
+## add .uns
+import shutil
+import os
+for i in range(4):
+  source_file = f'{(r.file_system.outs.values)[i]}/spatial/tissue_positions.csv' 
+  destination_file = f'{(r.file_system.outs.values)[i]}/spatial/tissue_positions_list.csv' 
+  shutil.copyfile(source_file, destination_file)
+  create_ann = sc.read_visium((r.file_system.outs.values)[i])
+  adata = sc.read(adatas[i])
+  adata.uns['spatial'] = create_ann.uns['spatial']
+  adata.obsm['spatial'] = np.asarray(create_ann.obsm['spatial'], dtype='float32')
+  adata.write_h5ad(adatas[i])
+  os.remove(destination_file)
+
+
+adata = sc.read(adatas[3])
+adata.obs[adata.uns['mod']['factor_names']] = adata.obsm['q05_cell_abundance_w_sf']
+adata.obs[adata.uns['mod']['factor_names']].columns
+clust_labels = ['MES_like', 'Astrocytes','MG_pro_infl','Pericyte']
+clust_col = ['' + str(i) for i in clust_labels]
+
+
+with mpl.rc_context({'figure.figsize': (15, 15)}):
+    fig = plot_spatial(
+        adata=adata, 
+        color=clust_col,
+        show_img=True,
+        labels=clust_labels, 
+        style='fast', 
+        max_color_quantile=0.8,
+        circle_diameter=4, 
+        colorbar_position='right'
+    )
+plt.show()
+
+```
+
+Update cell2location outputs to spata objects
+```{r}
+## Add cell2location to the spata files:
+for(i in 1:nrow(file_system)){
+  object = readRDS(file_system$SPATA[i])
+  sample_ID <- file_system$samples[i]
+  
+  message(sample_ID)
+  
+  cell_types_path <- paste0(root, "/",sample_ID,"_decov.csv")
+  cell_types <- read.csv(cell_types_path)
+  names(cell_types)[1] <- "barcodes"
+  cell_types_df <- cell_types
+  
+  names(cell_types_df) <- str_remove(names(cell_types_df), "q05cell_abundance_w_sf_")
+  names(cell_types_df) <- names(cell_types_df) %>% str_replace_all(., "[.]", "_")
+  object <- object %>% SPATA2::addFeatures(cell_types_df, overwrite = T)
+  saveRDS(object, file_system$SPATA[i])
+}
+
+
+cell_types_all <- names(cell_types_df)[2:length(names(cell_types_df))]
+saveRDS(cell_types_all, paste0(root, "cell_types_all.RDS"))
+
+```
+
+## Run Cytospace
+
+First you need to create the required outputs from the reference
+dataset:
+
+```{r}
+source("~/Desktop/MERFISH/EcoFoundation/R_Functions/Deconvolution.R")
+## First generate outputs from the single cells to run cytosypace:
+## Here it is important that the celltypes are stored again in "celltype" (as seen above)
+library(Seurat)
+library(data.table)
+
+scrna_seurat = readRDS("/Users/henrikheiland/Desktop/Cooperations/AQP4/SingleCell/integrated_new.RDS")
+scrna_seurat$celltype <- scrna_seurat$celtype_level1
+folder_ref = paste0(root,"/CytoSpace/Ref")
+if(!dir.exists(folder_ref)){dir.create(paste0(root,"/CytoSpace"));dir.create(folder_ref)}
+generate_cytospace_from_scRNA_seurat_object(scrna_seurat, dir_out = folder_ref,  rna_assay = "RNA")
+
+```
+
+Second: you can run the samples in a loop: Here it is important to know
+that the Deconvolution.R file creates a bash script output:
+
+`run <- paste0("conda run -n cytospace_v1.1.0 cytospace --scRNA-path '" , Ref_mat, "' --cell-type-path '", Ref_lables, "' --st-path '", paste0(sample_dir, "/counts.txt"), "' --coordinates-path '", paste0(sample_dir, "/coords.txt"), "' -o '", sample_dir, "' --cell-type-fraction-estimation-path '", paste0(sample_dir, "/Cell_Fraction.txt"), "' --solver-method 'lap_CSPR'" )`
+
+This will call cytospace in the defined conda env: conda run -n
+cytospace_v1.1.0 cytospace. It is important to define and update to you
+specific localisation and conda environment names.
+
+Also here we use the lap_CSPR solver which based on the fact that the lapjv solver is only working in intle architectures!
+
+```{r}
+## Set parameter and run loop:
+## Here it is important that the celltypes are stored again in "celltype" (as seen above)
+cell_types_all <- readRDS(paste0(root, "cell_types_all.RDS"))
+
+for(i in 1:nrow(file_system)){
+  print(i)
+  object = readRDS(file_system$SPATA[i])
+  sample_ID <- file_system$samples[i]
+  message(paste0(" 🚀 Run sample: ",sample_ID))
+  Reference_Annotation <- cell_types_all
+  CS_folder <- paste0(root,"/CytoSpace/", sample_ID)
+  Ref_mat = paste0(root,"/CytoSpace/Ref/scRNA_data.txt")
+  Ref_lables = paste0(root,"/CytoSpace/Ref/cell_type_labels.txt")
+  returnCytoSpace(object, Reference_Annotation, CS_folder, Ref_mat, Ref_lables)
+  
+} 
+
+shell = paste0(root,"/Cytospace/", file_system$samples, "/cytoSpace.sh")
+
+```
+
+```{python}
+## Now the create bash script can be executed
+
+cytospace_files = r.shell
+
+for i in range(4):
+  cmd = ["bash", cytospace_files[i]]
+  print("Running:", " ".join(cmd))
+  subprocess.run(cmd)
+
+```
+
+
+Import Cytospace into spata (as a single cell data.frame with spatial
+coords and the annotated cell position)
+
+```{r}
+
+for(i in 1:nrow(file_system)){
+  print(i)
+  object = readRDS(file_system$SPATA[i])
+  sample_ID <- file_system$samples[i]
+  message(paste0("Run sample: ",sample_ID))
+  
+  Reference_Annotation <- cell_types_all
+  CS_folder <- paste0(root,"/CytoSpace/", sample_ID)
+  Ref_mat = paste0(root,"/CytoSpace/Ref/scRNA_data.txt")
+  Ref_lables = paste0(root,"/CytoSpace/Ref/cell_type_labels.txt")
+  
+  cytospace = importCytoSpace(object, Reference_Annotation, CS_folder, Ref_mat, Ref_lables, scale=10)
+  object@spatial[[1]]$cytospace <- cytospace
+  saveRDS(object, file_system$SPATA[i])
+  
+} 
+
+```
+
+After you run all deconvolutionsteps you can create some nice infered single cell plots:
+
+```{r}
+## Read color schema
+colors <- readRDS("/Users/henrikheiland/Desktop/Cooperations/AQP4/SingleCell/colors.RDS")
+object <- readRDS(file_system$SPATA[3])
+celltype <- object@spatial[[1]]$cytospace
+cc <- colors$colors;names(cc) <- colors$celtype_level2
+
+library(ggforce)
+plotSurface(object,color_by="Pdgfb", alpha_by="Pdgfb")
+
+ggplot() +
+    geom_voronoi_tile(data = celltype, 
+                      aes(x_sc, y_sc, group = -1L, fill = CellType), max.radius = 4, colour = 'black', linewidth=0.1, alpha=0.8)+
+    scale_fill_manual(values=cc)+
+    theme_bw() +
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_rect(colour = "black", size=0.5),
+          axis.text.x = element_text(colour="black"),
+          axis.text.y = element_text(colour="black"))+
+    coord_fixed()+
+  theme(legend.text = element_text(size=6),
+        legend.key.size = unit(0.3, "cm"),
+        legend.title = element_text(size=8))+
+  SPATA2::ggpLayerAxesSI(object)+
+  xlab("Dimension x-space [cm]")+
+  ylab("Dimension y-space [cm]")
+
+```
+
+## Graph annotation
+
+In the next step we will process the samples and generate the graphs for
+the deep learning approch.
+
+```{python}
+import sys
+sys.path.append('/Users/henrikheiland/Desktop/MERFISH/EcoFoundation/PythonPackage/EcoFoundation/functions')  
+from utils import *
+from plt import *
+
+import scanpy as sc
+import tangram as tg
+import anndata as ad
+import squidpy as sq
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+samples_all = r.file_system.samples.values
+
+for sample in samples_all:
+  print(sample)
+  adata = sc.read(f"{r.root}/{sample}.h5ad")
+  ## Run preprocessing
+  sc.pp.pca(adata)
+  sc.pp.neighbors(adata)
+  sc.tl.umap(adata)
+  ## scVI
+  import scvi
+  scvi.model.SCVI.setup_anndata(adata)
+  model = scvi.model.SCVI(adata, n_latent=50)
+  model.train(accelerator = "cpu", max_epochs=200, early_stopping=True)
+  adata.obsm["X_scVI"] = model.get_latent_representation(adata)
+  adata.layers["X_exp"] = model.get_normalized_expression(adata)
+  adata.write_h5ad(f"{r.root}/{sample}.h5ad")
+
+```
+
+
+# Deep Learning approch:
+
+## Add predictiom parameters:
+We have to define what we aim to predict. Here I just use the 0/1 source of a sample and add this to our file_system:
+
+```{r}
+file_system$status = c(0,1,1,0)
+```
+
+
+## First we need to train a VAE which has all batches to provide normalized expression values:
+In this step we remove batch effects by train the dataset together and create a common VAE model. This will be used further to normalize the gene expression when single sample graphs will be created. This is very important to remove any batch effects fro the input data!
+
+```{python}
+## Merge all files and add batch:
+files = r.file_system["adata"].values
+status = r.file_system["status"].values
+samples_all = r.file_system["samples"].values
+
+adata_list = []
+for j,sample in enumerate(samples_all):
+    print(sample)
+    adata = ad.read_h5ad(f"{r.root}/{sample}.h5ad")
+    adata.obs["status"] = status[j]
+    adata_list.append(adata)
+adata_list
+
+for i, adata in enumerate(adata_list):
+    sample_name = samples_all[i]  # Create a unique sample identifier
+    adata.obs_names = [f"{bc}_{sample_name}" for bc in adata.obs_names]
+    adata.obs["batch_ID"] = sample_name
+adata_combined = ad.concat(adata_list, axis=0, join='outer', label='batch', keys=range(len(adata_list)), index_unique='-')
+adata_combined.obs["batch"]
+
+## process and filter
+adata_combined.layers['counts'] = adata_combined.X.copy()
+sc.pp.filter_cells(adata_combined, min_counts=40)
+adata_combined.obs["batch"]
+
+
+## Set up the model: 
+scvi.model.SCVI.setup_anndata(adata_combined, batch_key='batch')
+
+# Train:
+# Train SCVI model for integration
+model = scvi.model.SCVI(adata_combined, n_latent=50)
+model.train(accelerator = "cpu", max_epochs=100, early_stopping=True)
+
+
+# Use the trained model to get the corrected latent space
+adata_combined.obsm["X_scVI"] = model.get_latent_representation()
+
+## Save the model and adata file:
+model.save(f"{r.root}/VAE_ep250_fullData")
+adata_combined.write_h5ad(f"{r.root}/VAE_ep200_fullData.h5ad")
+```
+
+
+
+## Build ecosystems 
+This is the key snip of code to create you ecosystems out of the combined pretrained scVI dataset. Here we build the ecosystem sample by sample. The .x part of the PYG graph object contains the information which is taken into the GNN. Here we add the full expression dataset but it is also possible to use the latentspace (n=50) or something else into the data.x output of the PYG.
+
+```{python}
+
+adata_combined = sc.read_h5ad(f"{r.root}/VAE_ep200_fullData.h5ad")
+reference_model=scvi.model.SCVI.load(f"{r.root}/VAE_ep250_fullData",adata_combined)
+
+
+## Create data into a subgraphs
+## Function for loop:
+## It is important that this function need to be optimized based on the requirments of the subgraphs. The Parameter and thresholds need to be optimized based on the sample requirments. Note! Differences between Visium and MERSCOPE!
+
+#__________________________________________________________________________________________#
+def runfastgraph(adata, status, batch_id):
+  
+  adata.layers["counts"] = adata.X
+  adata.obs["batch"]=batch[batch_id]
+  adata.X = reference_model.get_normalized_expression(adata)
+  
+  adata = BuildGraph(adata,distance_threshold = 10) #This is the threshold used to filter the distance matrix!
+
+  adata = barcode_mapping(adata)
+  # hop (number of NN), max_overlap: The maximum numbers of overlaps per subgraph, min_nodes The minimal number of nodes in a graph!
+  subgraphs = getMaxSubgraphs(adata, hop=3, max_overlap=3, min_nodes=8) # Set up hyperparameters for the subgraphs
+  sub = BuildPYG(adata, subgraphs)
+  
+  # After the baseline subgraphs are created, we add edge atributtes, status etc. This can be adjusted to whatever you plan to add!
+  
+  ## Get the raw data
+  for i in range(len(sub)):
+    node_indices = np.asarray(sub[i].node_index)
+    sub[i].raw = torch.tensor(adata.layers["counts"][node_indices].toarray(), dtype=torch.float)
+    sub[i].edge_attr = sub[i].distance.unsqueeze(1)
+    sub[i].status = torch.tensor(status, dtype=torch.long)
+    sub[i].patient_source = torch.tensor(batch[batch_id], dtype=torch.long)
+  
+  return sub
+#__________________________________________________________________________________________#
+
+
+
+## Here we define the specific input that are required to build the graph:
+files = r.file_system["adata"].values ## File names
+status = r.file_system["status"].values ## The status that will be predicted
+samples_all = r.file_system["samples"].values ## Samples ID
+
+# If the status is not encoded as integer:
+t = pd.Series(status)  
+t_cat = pd.Categorical(t)
+status_num = t_cat.codes
+# The batches 
+batch = [0,1,2,3]
+
+
+## Here we build the subgraph of the first batch 
+graph = runfastgraph(adata_combined[adata_combined.obs['batch'] == 0].copy(),status_num[0], batch[0]).copy()
+
+## Add graphs to the existing one:
+for i in range(1,len(files)):
+  gg = runfastgraph(adata_combined[adata_combined.obs['batch'] == i].copy(), status_num[i], batch[i]).copy()
+  graph = graph+gg
+
+
+## Check output
+len(graph)
+torch.save(graph, f"{r.root}/subgraphs.pt")
+sub = graph
+
+```
+
+```{r}
+saveRDS(file_system, paste0(root, "/file_system.RDS"))
+```
+
+We preprocessed the samples and build our graphs (Ecosystems). From this point we will proceed with the prediction tasks.
+
+
+# Used GNN to predict:
+
+## Load Subgraphs:
+```{python}
+import torch
+sub = torch.load(f"{r.root}/subgraphs.pt")
+```
+
+Here we would be interested in the NN which are predictive for sample status (0 high vs 1). This will be represented by a GNN including nodes (spots) and edges (distance). We will use a attention GNN including the attentions as outputs for XAI.
+
+Load the architectures: 
+
+```{python}
+import sys
+sys.path.append('/Users/henrikheiland/Desktop/MERFISH/EcoFoundation/PythonPackage/EcoFoundation/models')  
+from GAM_V1 import *
+```
+
+In the 2nd step we build the full model by adding a MLP to the GNN architecture:
+```{python}
+
+class GraphMERFISH_MultiTask(torch.nn.Module):
+    def __init__(self, num_features_exp, hidden_channels, num_classes_task1, edge_dim=1):
+        super().__init__()
+        self.encoder = GraphEncoder(num_features_exp, hidden_channels, edge_dim=edge_dim)
+        self.task1_head = MLP(hidden_channels, num_classes_task1)
+
+    def forward(self, data):
+        x, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr, data.batch
+        node_latent, graph_latent, att1, att2 = self.encoder(x, edge_index, edge_attr, batch)
+        task1_out = self.task1_head(graph_latent)
+        return node_latent, task1_out, att1, att2
+
+```
+
+## Training function including discriminator:
+```{python}
+from tqdm import tqdm
+import numpy as np
+
+def train_discriminator(model, discriminator, train_loader, val_loader, criterion1, criterion_discriminator, optimizer, optimizer_discriminator, num_epochs=50, patience=5):
+    early_stopping = EarlyStopping(patience=patience, delta=0.01)
+
+    for epoch in range(num_epochs):
+        model.train()
+        discriminator.train()
+        epoch_loss = 0
+        total_discriminator_loss = 0
+
+        for data in tqdm(train_loader):
+            # Train primary model
+            optimizer.zero_grad()
+            data.edge_attr = data.distance.view(-1, 1).float()
+            node_latent, task1_out, att1, att2 = model(data.to(device))
+            
+            
+            #loss status
+            status = data.status.long().to(device)
+            loss = criterion1(task1_out, status)
+            
+            
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+
+            # Train discriminator
+            optimizer_discriminator.zero_grad()
+            patient_source = data.patient_source.long().to(device)
+            discriminator_pred = discriminator(node_latent.detach())
+            discriminator_pred = global_mean_pool(discriminator_pred, data.batch)
+            discriminator_loss = criterion_discriminator(discriminator_pred, patient_source)
+            discriminator_loss.backward()
+            optimizer_discriminator.step()
+            total_discriminator_loss += discriminator_loss.item()
+
+            # Adversarial step
+            optimizer.zero_grad()
+            node_latent, task1_out, att1, att2 = model(data.to(device))
+            discriminator_pred = discriminator(node_latent)
+            discriminator_pred = global_mean_pool(discriminator_pred, data.batch)
+            adversarial_loss = -criterion_discriminator(discriminator_pred, patient_source)
+            adversarial_loss.backward()
+            optimizer.step()
+
+        # Validation (primary model only)
+        model.eval()
+        val_loss = 0
+        val_outputs_1 = []
+        val_labels = []
+
+        with torch.no_grad():
+            for data in val_loader:
+                data.edge_attr = data.distance.view(-1, 1).float()
+                node_latent, task1_out, att1, att2 = model(data.to(device))
+                val_outputs_1.append(torch.argmax(task1_out, dim=1).detach().cpu().numpy())
+                pred_1 = data.status.long().to(device)
+                val_labels.append(pred_1.cpu().numpy())
+                val_loss += criterion1(task1_out, pred_1).item()
+
+        val_loss /= len(val_loader)
+        pred = np.concatenate(val_outputs_1)
+        true_labels = np.concatenate(val_labels)
+
+        # Print results
+        print("Epoch {}/{}".format(epoch + 1, num_epochs))
+        print("Train Loss: {:.4f}, Discriminator Loss: {:.4f}, Val Loss: {:.4f}".format(epoch_loss / len(train_loader), total_discriminator_loss / len(train_loader), val_loss))
+        print("Validation Accuracy:", accuracy_score(true_labels, pred))
+
+        # Early stopping
+        early_stopping(val_loss, model)
+        if early_stopping.early_stop:
+            print("Early stopping")
+            break
+
+    model.load_state_dict(torch.load('checkpoint.pt'))
+
+
+def train(model, train_loader, val_loader, criterion1, optimizer, num_epochs=50, patience=5):
+    early_stopping = EarlyStopping(patience=patience, delta=0.01)
+
+    for epoch in range(num_epochs):
+        model.train()
+        epoch_loss = 0
+
+        for data in tqdm(train_loader):
+            # Train primary model
+            optimizer.zero_grad()
+            data.edge_attr = data.distance.view(-1, 1).float()
+            node_latent, task1_out, att1, att2 = model(data.to(device))
+            
+            
+            #loss status
+            status = data.status.long().to(device)
+            loss = criterion1(task1_out, status)
+            
+            
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+
+        # Validation (primary model only)
+        model.eval()
+        val_loss = 0
+        val_outputs_1 = []
+        val_labels = []
+
+        with torch.no_grad():
+            for data in val_loader:
+                data.edge_attr = data.distance.view(-1, 1).float()
+                node_latent, task1_out, att1, att2 = model(data.to(device))
+                val_outputs_1.append(torch.argmax(task1_out, dim=1).detach().cpu().numpy())
+                pred_1 = data.status.long().to(device)
+                val_labels.append(pred_1.cpu().numpy())
+                val_loss += criterion1(task1_out, pred_1).item()
+
+        val_loss /= len(val_loader)
+        pred = np.concatenate(val_outputs_1)
+        true_labels = np.concatenate(val_labels)
+
+        # Print results
+        print("Epoch {}/{}".format(epoch + 1, num_epochs))
+        print("Train Loss: {:.4f}, Val Loss: {:.4f}".format(epoch_loss / len(train_loader), val_loss))
+        print("Validation Accuracy:", accuracy_score(true_labels, pred))
+
+        # Early stopping
+        early_stopping(val_loss, model)
+        if early_stopping.early_stop:
+            print("Early stopping")
+            break
+
+    model.load_state_dict(torch.load('checkpoint.pt'))
+
+```
+
+## Run Training:
+Here we define hyperparameters and build the full model:
+```{python}
+device="cuda" if torch.cuda.is_available() else "cpu"
+#----------------- Parameter:
+num_features_exp = sub[1].x.shape[1] #Number of genes
+hidden_channels=125 # Hidden channels GNN
+num_classes_task1=2 # Number of classes to be predicted
+edge_dim=1 #Number (dimensions) of edge information
+
+# Discriminator:
+num_classes=4 #Number of batches
+
+model = GraphMERFISH_MultiTask(
+    num_features_exp=num_features_exp, 
+    hidden_channels=hidden_channels, 
+    num_classes_task1=num_classes_task1, 
+    edge_dim=1
+)
+
+discriminator = Discriminator(input_size=125, hidden_size=32, num_classes=num_classes) ## ! input_size ==hidden_channels
+
+# Optimizer:
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+optimizer_discriminator = torch.optim.Adam(discriminator.parameters(), lr=0.001)
+
+# Loss functions:
+criterion1 = nn.CrossEntropyLoss()
+criterion_discriminator = nn.NLLLoss()
+
+```
+
+
+## Create Dataloader and train
+Here my experiance: The sparser the input data the more a model benefit from using a discriminator for batch effect removal. As soon as the model get richer inputs do not use the discriminator. Also in case your model contains already normalized and batch cleaned data, I would use only normal training:
+```{python}
+
+from torch.utils.data import random_split
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
+
+## Prepare training and val data:
+data_list = sub
+train_ratio = 0.8
+val_ratio = 0.2
+train_size = int(len(data_list) * train_ratio)
+val_size = len(data_list) - train_size
+train_data, val_data = random_split(data_list, [train_size, val_size])
+
+# Create data loaders
+from torch_geometric.loader import DataLoader
+train_loader = DataLoader(train_data, batch_size=10, shuffle=False)
+val_loader = DataLoader(val_data, batch_size=10, shuffle=False)
+
+# If you ant to test:
+#data = next(iter(train_loader))
+#data.edge_attr = data.distance.view(-1, 1).float()
+#first_batch = next(iter(train_loader))
+#node_latent, task1_out, att1, att2 = model(data.to(device))
+
+## With discriminator:
+train_discriminator(
+    model=model,
+    discriminator=discriminator,
+    train_loader=train_loader,
+    val_loader=val_loader,
+    criterion1=criterion1,
+    criterion_discriminator=criterion_discriminator,
+    optimizer=optimizer,
+    optimizer_discriminator=optimizer_discriminator,
+    num_epochs=50,
+    patience=5
+)
+
+## Without discriminator:
+train(
+    model=model,
+    train_loader=train_loader,
+    val_loader=val_loader,
+    criterion1=criterion1,
+    optimizer=optimizer,
+    num_epochs=50,
+    patience=5
+)
+
+## Store model:
+torch.save(model, f"{r.root}/GNN_trained_AQP4_KO_noDis.pt")
+
+```
+
+Finally we have trained our model. Now its time to look mor in detail and evaluate the predicted outputs. Here I used 4 samples which are samples from either WT or APQ4-KO mouse with a PDGFB tumor. We tried to determine Ecosystems for WT or AQP4 tumors:
+
+#Evaluate data:
+
+```{python}
+
+model.eval()
+val_outputs_1 = []
+val_labels1 = []
+logit1 = []
+
+
+full_data = DataLoader(sub, batch_size=10, shuffle=False)
+
+with torch.no_grad():
+  for data in full_data:
+    data.edge_attr = data.distance.view(-1, 1).float()
+    node_latent, task1_out, att1, att2 = model(data.to(device))
+    logit1.append(task1_out.detach().cpu().numpy())
+    val_outputs_1.append(torch.argmax(task1_out, dim=1).detach().cpu().numpy())
+    pred_1 = data.status.long().to(device)
+    val_labels1.append(pred_1.cpu().numpy())
+
+pred_1_all = np.concatenate(val_outputs_1)
+label_1_all = np.concatenate(val_labels1)
+logits_1_all = np.concatenate(logit1)
+
+
+## Check confusion map
+predicted = pred_1_all
+labels = label_1_all
+print("Accuracy:", accuracy_score(labels, predicted))
+print("Precision:", precision_score(labels, predicted, average='macro'))
+print("Recall:", recall_score(labels, predicted, average='macro'))
+print("F1 Score:", f1_score(labels, predicted, average='macro'))
+print("Confusion Matrix:\n", confusion_matrix(labels, predicted))
+
+cm = confusion_matrix(labels, predicted)
+import seaborn as sns
+import matplotlib.pyplot as plt
+plt.figure(figsize=(10, 8))
+sns.heatmap(cm, annot=True, fmt='g', cmap='Blues')
+plt.xlabel('Predicted')
+plt.ylabel('True')
+plt.title('Confusion Matrix: True vs Predicted')
+plt.show()
+
+```
+In this example a clear overfitting on the data but we aim to get some XAI features:
+
+```{r}
+# Get all the results in a dataframe:
+res = data.frame(status = py$pred_1_all, logit = py$logits_1_all)
+saveRDS(res, paste0(root, "/", "prediction_res.RDS"))
+
+
+## Plot the logits:
+## If you have multiple classes you can also use the logits as an input for a umap! (Nice plots)
+
+library(scales)
+ggplot(res)+
+  geom_point(mapping = aes(x=logit.1 %>% rescale(., c(0,1)), 
+                           y=logit.2 %>% rescale(., c(0,1)),
+                           color = logit.1 %>% rescale(., c(0,1))),
+             )+
+  scale_color_gradientn(colors = rev(RColorBrewer::brewer.pal(9, "RdBu")))+
+  theme_bw() +
+      theme(panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            panel.background = element_rect(colour = "black", size=0.5),
+            axis.text.x = element_text(colour="black"),
+            axis.text.y = element_text(colour="black"))+
+      coord_fixed()+
+    theme(legend.text = element_text(size=6),
+          legend.key.size = unit(0.3, "cm"),
+          legend.title = element_text(size=8))+
+    guides(color = guide_colourbar(barwidth = 0.3, barheight = 8, ticks =F, frame.colour="black"), label=F)
+
+
+```
+
+## Analysis of representative ecosystem
+Here it is important to know that we do not uses the same downstream analysis between Visium and MERFISH data (based on the resolution). So this example uses Visium and our deconvolution data to demonstrate the dwonstream analysis. I also don't want to go into much detail. Here is the way to get typical enriched ecosystems on single cell level:
+
+```{r}
+## Read SPATA object
+spata_obj <-  readRDS(file_system$SPATA[1])
+## Get Cell type deconvolution
+celltype = spata_obj@spatial[[1]]$cytospace
+```
+
+Next we get all subgraphs, define the inputs and function:
+```{python}
+#__________________________________________________________________________________________#
+def runfullgraph(adata, status, batch_id):
+  
+  adata.layers["counts"] = adata.X
+  adata.obs["batch"]=batch[batch_id]
+  adata.X = reference_model.get_normalized_expression(adata)
+  
+  adata = BuildGraph(adata,distance_threshold = 5) #This is the threshold used to filter the distance matrix!
+  adata = barcode_mapping(adata)
+  # Here we allow overlap!
+  subgraphs, central_nodes = getfullSubgraphs(adata, hop=3, min_nodes=20) # Set up hyperparameters for the subgraphs
+  sub = BuildPYG(adata, subgraphs)
+  # After the baseline subgraphs are created, we add edge atributtes, status etc. This can be adjusted to whatever you plan to add!
+  
+  ## Get the raw data
+  for i in range(len(sub)):
+    node_indices = np.asarray(sub[i].node_index)
+    sub[i].raw = torch.tensor(adata.layers["counts"][node_indices].toarray(), dtype=torch.float)
+    sub[i].edge_attr = sub[i].distance.unsqueeze(1)
+    sub[i].status = torch.tensor(status, dtype=torch.long)
+    sub[i].patient_source = torch.tensor(batch[batch_id], dtype=torch.long)
+  
+  return sub, central_nodes
+#__________________________________________________________________________________________#
+
+
+#__________________________________________________________________________________________#
+## Here we define the specific input that are required to build the graph:
+files = r.file_system["adata"].values ## File names
+status = r.file_system["status"].values ## The status that will be predicted
+samples_all = r.file_system["samples"].values ## Samples ID
+# If the status is not encoded as integer:
+t = pd.Series(status)  
+t_cat = pd.Categorical(t)
+status_num = t_cat.codes
+# The batches 
+batch = [0,1,2,3]
+#__________________________________________________________________________________________#
+
+```
+
+Run evaluation:
+```{python}
+adata_combined = sc.read_h5ad(f"{r.root}/VAE_ep200_fullData.h5ad")
+adata_eval = adata_combined[adata_combined.obs['batch'] == 0].copy()
+graph, nodes = runfullgraph(adata_eval,status_num[0], batch[0])
+
+model.eval()
+val_outputs_1 = []
+val_labels1 = []
+logit1 = []
+bcs_subgraph = []
+
+with torch.no_grad():
+  for i, data in enumerate(graph):
+    data.edge_attr = data.distance.view(-1, 1).float()
+    node_latent, task1_out, att1, att2 = model(data.to(device))
+    logit1.append(task1_out.detach().cpu().numpy())
+    val_outputs_1.append(torch.argmax(task1_out, dim=1).detach().cpu().numpy())
+    pred_1 = data.status.long().to(device)
+    val_labels1.append(pred_1.cpu().numpy())
+    bcs_subgraph.append(adata_eval.obs.index[data.node_index].values)
+
+label_1_all = np.hstack(val_labels1)
+logits_1_all = np.concatenate(logit1)
+bcs_all = adata_eval.obs.index[nodes].values
+
+```
+
+Merge the information together in a data.frame
+```{r}
+res = 
+  data.frame(subgraph_nr = 1:length(py$bcs_all), barcodes_graph = py$bcs_all, status = py$pred_1_all, logit = py$logits_1_all) %>% 
+  mutate(barcodes = barcodes_graph %>% str_split(., "_") %>% map(.,~.x[[1]]) %>% unlist()) %>% 
+  mutate(KO = logit.1)
+subgraph_nodes <- map(py$bcs_subgraph,~ .x %>% str_split(., "_") %>% map(.,~.x[[1]]) %>% unlist())
+
+```
+
+Here we can get the full prediction and plot it over the images:
+```{r}
+spata_obj <- addFeatures(spata_obj, data.frame(barcodes=res$barcodes, KO = res$KO), overwrite = T)
+SPATA2::plotSurface(spata_obj, pt_alpha=0.5, color_by = "KO", limits=c(4.9,5), oob=scales::squish)
+```
+
+
+```{r}
+## Get top ecosystems for KO prediction
+res %>% arrange(desc(KO)) %>% head(20)
+
+subgraph_nr=2136
+## Read color schema
+colors <- readRDS("/Users/henrikheiland/Desktop/Cooperations/AQP4/SingleCell/colors.RDS")
+cc <- colors$colors;names(cc) <- colors$celtype_level2
+plotEcosystem(spata_obj, subgraph_nodes, subgraph_index=subgraph_nr, extend=0.2)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
