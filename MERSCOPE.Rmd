@@ -1,0 +1,1782 @@
+---
+title: "Pipeline MESCOPE Preprocessing"
+author: "Dieter Henrik Heiland"
+date: "2025-03-11"
+output: html_document
+---
+
+## Setup Environment:
+
+Postprocessing from the SOPA pipeline
+
+```{r}
+reticulate::use_condaenv("EcoFoundation")
+library(reticulate)
+library(SPATA2)
+library(Seurat)
+library(tidyverse)
+library(sp)
+
+## Import functions
+source("~/Desktop/MERFISH/EcoFoundation/R_Functions/utils.R")
+
+## Plot Cell Types
+colors <- readRDS("/Users/dieterhenrikheiland/Desktop/RecurrentGBM/SingleCellRef/GBM_Neuron_colors.RDS")
+colors$annotation_level_4new <- 
+  colors$annotation_level_4 %>% 
+  str_replace_all(" ", "_") %>% 
+  str_replace_all("-", "_") %>% 
+  str_replace_all("/", "_")
+
+
+```
+
+```{r}
+## Set up directory:
+root = "/Users/dieterhenrikheiland/Desktop/NeuralScore/Pembro/MERFISH"
+## Two samples R5 = neural low /R6 = neural high
+
+```
+
+
+## Table and sample annotation
+```{r}
+
+anno_1 = data.frame(file_h5ad=c("R5", 
+                       "R6",
+                       "Pembro_region_3",
+                       "Pembro_region_6",
+                       "Pembro_region_8",
+                       "Pembro_region_9",
+                       "Pembro_region_10",
+                       "Pembro_region_11",
+                       "Pembro_region_12"),
+           neural_type = c("low",
+                           "high",
+                           "high",
+                           "high",
+                           "low",
+                           "low",
+                           "low",
+                           "high",
+                           "high")
+           )
+
+
+```
+
+
+# Preprocessing
+## Read the Andata files
+```{python}
+import sys
+sys.path.append('/Users/dieterhenrikheiland/Desktop/MERFISH/EcoFoundation/PythonPackage/EcoFoundation/functions')  
+from utils import *
+from plt import *
+
+import scanpy as sc
+import tangram as tg
+import anndata as ad
+import squidpy as sq
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+samples_all = r.anno_1["file_h5ad"].values
+
+for sample in samples_all:
+  print(sample)
+  adata = ad.read_h5ad(f"{r.root}/{sample}_result_file.h5ad")
+  ## Run preprocessing
+  sc.pp.pca(adata)
+  sc.pp.neighbors(adata)
+  sc.tl.umap(adata)
+  sc.tl.leiden(adata)
+  ## scVI
+  import scvi
+  scvi.model.SCVI.setup_anndata(adata)
+  model = scvi.model.SCVI(adata, n_latent=50)
+  model.train(accelerator = "cpu", max_epochs=200, early_stopping=True)
+  adata.obsm["X_scVI"] = model.get_latent_representation(adata)
+  adata.layers["X_exp"] = model.get_normalized_expression(adata)
+  ## UMAP
+  sc.pp.neighbors(adata, use_rep="X_scVI")
+  sc.tl.umap(adata)
+  sc.pl.umap(adata, color=['annotation_level_4'])
+  adata.write_h5ad(f"{r.root}/{sample}_result_file_processed.h5ad")
+
+
+## Plot samples
+sc.pl.umap(adata,color=["leiden",],wspace=0.4)
+sq.pl.spatial_scatter(adata,color=["leiden",],wspace=0.4)
+plt.show()
+
+```
+
+
+
+## Process the samples and split primary and recurrent
+
+## Transform data into SPATA
+```{r}
+library(anndata)
+i=2
+
+adata = anndata::read_h5ad(paste0(root, "/", anno_1$file_h5ad[i], "_result_file_processed.h5ad"))
+sample_name = anno_1$file_h5ad[i]
+
+MERSCOPEpy2SPATA <- function(adata, sample_name, scVI = F, image=NULL, shapes=NULL){
+  
+  meta <- adata$obs %>% rownames_to_column("barcodes")
+  coords <- meta %>% dplyr::select(barcodes,x,y)
+  cellxgene <- adata$X %>% t()
+  
+  object <- 
+    SPATA2::initiateSpataObject_CountMtr(coords_df = coords,
+                                       count_mtr = cellxgene,
+                                       sample_name = sample_name,
+                                       ScaleData=T, RunPCA=F, FindNeighbors=F, FindClusters=F, RunTSNE=F, RunUMAP=F)
+
+  object <- 
+    SPATA2::addFeatures(object, meta)
+  
+  if(scVI==T){
+    scVI = adata$layers[["X_exp"]] %>% t()
+    object <- SPATA2::addExpressionMatrix(object, expr_mtr = scVI,  mtr_name= "scVI")
+    object <- SPATA2::setActiveExpressionMatrix(object , "scVI")
+  }
+  
+  
+  #plotSurface(object, color_by="CD3D", display_image=F, use_scattermore=T)
+  
+  
+  
+  ## If shapes data are avaiable the slot shapes is the path to the shapes data
+  if(!is.null(shapes)){
+    message("Add shape data")
+    shape_input = arrow::read_parquet(shapes)
+  }
+  
+  ## If image data are avaiable the slot image is the path to the image data
+  if(!is.null(image) ){
+    message("Add Image data")
+  }
+  
+  return(object)
+  
+}
+MERSCOPEsplitSPATA <- function (object, barcodes, verbose = NULL) {
+    hlpr_assign_arguments(object)
+    bcs_keep <- barcodes
+    object <- getFeatureDf(object) %>% dplyr::filter(barcodes %in% 
+        {
+            {
+                bcs_keep
+            }
+        }) %>% dplyr::mutate(dplyr::across(.cols = where(base::is.factor), 
+        .fns = base::droplevels)) %>% setFeatureDf(object = object, 
+        feature_df = .)
+    object <- getCoordsDf(object) %>% dplyr::filter(barcodes %in% 
+        {
+            {
+                bcs_keep
+            }
+        }) %>% setCoordsDf(object, coords_df = .)
+    object@data[[1]] <- purrr::map(.x = object@data[[1]], .f = ~.x[, 
+        bcs_keep])
+    object@trajectories[[1]] <- purrr::map(.x = object@trajectories[[1]], 
+        .f = function(traj) {
+            traj@projection <- dplyr::filter(traj@projection, 
+                barcodes %in% {
+                  {
+                    bcs_keep
+                  }
+                })
+            return(traj)
+        })
+    object@information$barcodes <- object@information$barcodes[object@information$barcodes %in% 
+        bcs_keep]
+    object@information[["subset"]][["barcodes"]] <- c(barcodes, 
+        object@information[["subset"]][["barcodes"]])
+    if (base::is.numeric(object@information[["subsetted"]])) {
+        object@information[["subsetted"]] <- object@information[["subsetted"]] + 
+            1
+    }
+    else {
+        object@information[["subsetted"]] <- 1
+    }
+    #object <- setTissueOutline(object, verbose = verbose)
+    n_bcsp <- nBarcodes(object)
+    confuns::give_feedback(msg = glue::glue("{n_bcsp} barcode spots remaining."), 
+        verbose = verbose)
+    return(object)
+}
+
+object <- MERSCOPEpy2SPATA(adata, sample_name, scVI=T)
+
+## If samples need to be split
+coords <- getCoordsDf(object) %>% as.data.frame();rownames(coords) <- coords$barcodes;coords <- coords %>% select(x,y)
+preOP <- NFCN2::getPoints(coords)
+postOP <- NFCN2::getPoints(coords)
+obj_pre = MERSCOPEsplitSPATA(object, preOP)
+obj_post = MERSCOPEsplitSPATA(object, postOP)
+
+plotSurface(obj_pre, color_by="CD3D", alpha_by ="CD3D", pt_size=3, use_scattermore=T, display_image=F)
+plotSurface(obj_post, color_by="CD3D", alpha_by ="CD3D", pt_size=2, use_scattermore=T, display_image=F)
+
+
+## save Data as SPATA2 and Anndata
+saveRDS(obj_pre, paste0(root, "/", sample_name, "_spata_obj_preOP.RDS"))
+saveRDS(obj_post, paste0(root, "/", sample_name, "_spata_obj_postOP.RDS"))
+
+## Anndata: 
+spata2adata <- function(object){
+  
+## Transfer SPATA2 objects to anndata
+library(SingleCellExperiment)
+sc <- reticulate::import("scanpy")
+np <- reticulate::import("numpy")
+pd <- reticulate::import("pandas")
+bc <- getBarcodes(object)
+sce <- 
+  Seurat::CreateSeuratObject(counts=SPATA2::getCountMatrix(object)) %>% 
+  Seurat::as.SingleCellExperiment()
+exprs <- assay(sce, "counts")
+col_data <- as.data.frame(colData(sce))
+row_data <- as.data.frame(rowData(sce))
+## Create AnnData
+
+adata = sc$AnnData(X = t(exprs),obs = col_data, var = row_data)
+adata$obsm[["spatial"]] <- getCoordsDf(object)[,c("x", "y")] %>% as.matrix()
+
+return(adata)
+}
+obj_pre_ad <- spata2adata(obj_pre)
+obj_post_ad <- spata2adata(obj_post)
+obj_pre_ad$write_h5ad(paste0(root, "/", sample_name, "_spata_obj_preOP.h5ad"))
+obj_post_ad$write_h5ad(paste0(root, "/", sample_name, "_spata_obj_postOP.h5ad"))
+
+```
+
+```{r}
+## New Annotation file
+
+anno_2 = data.frame(h5ad = c(paste0(root, "/", anno_1$file_h5ad[1:8], "_spata_obj_preOP.h5ad"),
+                             paste0(root, "/", anno_1$file_h5ad[1:8], "_spata_obj_postOP.h5ad")),
+                    SPATA = c(paste0(root, "/", anno_1$file_h5ad[1:8], "_spata_obj_preOP.RDS"),
+                             paste0(root, "/", anno_1$file_h5ad[1:8], "_spata_obj_postOP.RDS")),
+                    neural = c(anno_1$neural_type[1:8], anno_1$neural_type[1:8]),
+                    status = c(rep("de_novo", 8),rep("rec", 8))
+)
+
+#saveRDS(anno_2, paste0(root,"/Annotation_file.RDS"))
+
+anno_2 <- readRDS(paste0(root,"/Annotation_file.RDS"))
+
+```
+
+## Create a UMAP from all samples
+
+```{python}
+
+## Merge all files and add batch:
+files = r.anno_2["h5ad"].values
+status = r.anno_2["status"].values
+neural = r.anno_2["neural"].values
+
+adata_list = []
+for j,sample in enumerate(samples_all):
+    print(sample)
+    adata = ad.read_h5ad(f"{r.root}/{sample}_result_file.h5ad")
+    adata.obs["status"] = status[j]
+    adata.obs["neural"] = neural[j]
+    adata_list.append(adata)
+adata_list
+
+for i, adata in enumerate(adata_list):
+    sample_name = samples_all[i]  # Create a unique sample identifier
+    adata.obs_names = [f"{bc}_{sample_name}" for bc in adata.obs_names]
+    adata.obs["batch_ID"] = sample_name
+adata_combined = ad.concat(adata_list, axis=0, join='outer', label='batch', keys=range(len(adata_list)), index_unique='-')
+
+## process and filter
+adata_combined.layers['counts'] = adata_combined.X.copy()
+sc.pp.filter_cells(adata_combined, min_counts=100)
+
+## Set up the model: 
+scvi.model.SCVI.setup_anndata(adata_combined, batch_key='batch')
+
+# Train:
+# Train SCVI model for integration
+model = scvi.model.SCVI(adata_combined, n_latent=50)
+model.train(accelerator = "cpu", max_epochs=100, early_stopping=True)
+
+
+# Use the trained model to get the corrected latent space
+adata_combined.obsm["X_scVI"] = model.get_latent_representation()
+sc.pp.neighbors(adata_combined, use_rep="X_scVI")
+sc.tl.umap(adata_combined)
+sc.pl.umap(adata_combined, color=['batch'])
+
+
+
+## Create a supervided UMAP
+## get UMAP of the latent space:
+
+def runSUMAP(data, target, training_rate=0.8, filename="fitter.sav"):
+  #target = r.numeric_labels
+  target = np.asarray(target)
+  masked_target = target.copy().astype(np.int8)
+  masked_target[np.random.choice(len(target), size=int(len(target)*training_rate), replace=False)] = -1
+  print("Run UMAP Fit")
+  fitter = umap.UMAP().fit(data, y=masked_target)
+  embedding = fitter.embedding_
+  return(embedding)
+
+import pandas as pd
+import umap
+z_scaled = adata_combined.obsm["X_scVI"]
+cells =  adata_combined.obs["annotation_level_4"].values
+cells = pd.Series(cells).cat.codes.to_numpy()
+embedding = runSUMAP(z_scaled, target = cells, training_rate=1)
+
+#adata_combined.obsm["X_umap_scVI"] = adata_combined.obsm["X_umap"]
+adata_combined.obsm["X_umap"] = embedding
+sc.pl.umap(adata_combined, color=['annotation_level_4'], add_outline=True, size=20, outline_width=(1, 2))
+sc.pl.umap(adata_combined, color=['neural'], add_outline=True, size=20, outline_width=(1, 2))
+sc.pl.umap(adata_combined, color=['status'], add_outline=True, size=20, outline_width=(1, 2))
+
+sc.pl.umap(adata_combined, color=['CD3D'], add_outline=True, size=20, outline_width=(1, 2))
+sc.pl.umap(adata_combined, color=['CD163'], add_outline=True, size=20, outline_width=(1, 2))
+
+
+## Add color code 
+r.colors["annotation_level_4"].values
+color_df = pd.DataFrame({
+    "annotation_level_4": r.colors["annotation_level_4"].values,
+    "color": r.colors["colors"].values
+})
+# Map colors to cell types in adata.obs["celltype"]
+celltype_colors = dict(zip(color_df["annotation_level_4"], color_df["color"]))
+
+# Assign the colors to adata.uns
+adata_combined.uns["annotation_level_4_colors"] = [celltype_colors[ct] for ct in adata_combined.obs["annotation_level_4"].cat.categories]
+
+
+## Save the model and adata file:
+model.save(f"{r.root}/VAE_ep250")
+adata_combined.write_h5ad(f"{r.root}/VAE_ep200.h5ad")
+
+```
+
+## Singel cell analysis
+
+```{python}
+import matplotlib
+matplotlib.use("pdf")  # Ensures PDF backend
+from matplotlib import rcParams
+rcParams["font.family"] = "Helvetica"
+rcParams["pdf.fonttype"] = 42  # Embed fonts as text, not paths
+
+
+## Clustering
+sc.tl.leiden(adata_combined)
+
+
+sc.pl.umap(adata_combined, color=["leiden"], add_outline=True, size=20, outline_width=(1, 2))
+#umap.savefig(f"{r.root}/Analysis/umap_leiden.pdf", format="pdf", bbox_inches="tight")
+## Neural 
+sc.pl.umap(adata_combined, color=["neural"], add_outline=True, size=20, outline_width=(1, 2))
+sc.pl.umap(adata_combined, color=["status"], add_outline=True, size=20, outline_width=(1, 2))
+
+## plot only recurrent:
+adata_rec = adata_combined[adata_combined.obs["status"] == "rec"].copy()
+sc.pl.umap(adata_rec, color="neural",add_outline=True, size=50, outline_width=(1, 2))
+
+
+adata_combined.layers["counts"] =  adata_combined.X
+adata_combined.X = model.get_normalized_expression(adata_combined)
+sc.tl.rank_genes_groups(adata_combined, groupby="leiden", method="wilcoxon")
+
+fig = sc.pl.rank_genes_groups_dotplot(adata_combined, groupby="leiden", standard_scale="var", n_genes=10, return_fig=True)
+fig.savefig(f"{r.root}/Analysis/dotplot_10.pdf", format="pdf", bbox_inches="tight")
+adata_combined.write_h5ad(f"{r.root}/VAE_ep200.h5ad")
+
+```
+
+# Deep Learning approch:
+
+## First we need to train a VAE which has all batches to provide normalized expression values:
+```{python}
+## Merge all files and add batch:
+files = r.anno_2["h5ad"].values
+status = r.anno_2["status"].values
+neural = r.anno_2["neural"].values
+
+adata_list = []
+for j,sample in enumerate(samples_all):
+    print(sample)
+    adata = ad.read_h5ad(f"{r.root}/{sample}_result_file.h5ad")
+    adata.obs["status"] = status[j]
+    adata.obs["neural"] = neural[j]
+    adata_list.append(adata)
+adata_list
+
+for i, adata in enumerate(adata_list):
+    sample_name = samples_all[i]  # Create a unique sample identifier
+    adata.obs_names = [f"{bc}_{sample_name}" for bc in adata.obs_names]
+    adata.obs["batch_ID"] = sample_name
+adata_combined = ad.concat(adata_list, axis=0, join='outer', label='batch', keys=range(len(adata_list)), index_unique='-')
+adata_combined.obs["batch"]
+
+## process and filter
+adata_combined.layers['counts'] = adata_combined.X.copy()
+sc.pp.filter_cells(adata_combined, min_counts=40)
+adata_combined.obs["batch"]
+
+
+## Set up the model: 
+scvi.model.SCVI.setup_anndata(adata_combined, batch_key='batch')
+
+# Train:
+# Train SCVI model for integration
+model = scvi.model.SCVI(adata_combined, n_latent=50)
+model.train(accelerator = "cpu", max_epochs=100, early_stopping=True)
+
+
+# Use the trained model to get the corrected latent space
+adata_combined.obsm["X_scVI"] = model.get_latent_representation()
+
+## Save the model and adata file:
+model.save(f"{r.root}/VAE_ep250_fullData")
+adata_combined.write_h5ad(f"{r.root}/VAE_ep200_fullData.h5ad")
+```
+
+
+Here an example how the data will look like to build graphs from spatil inputs
+```{python}
+files = r.anno_2["h5ad"].values
+status = r.anno_2["status"].values
+neural = r.anno_2["neural"].values
+
+adata = ad.read_h5ad(files[0])
+adata.layers["counts"] = adata.X
+
+## Build Graph from adata:
+adata = BuildGraph(adata)
+adata = barcode_mapping(adata)
+subgraphs = getMaxSubgraphs(adata, hop=15)
+
+adata.obs["batch"]=0
+adata.X = model.get_normalized_expression(adata)
+
+sub = BuildPYG(adata, subgraphs)
+len(sub)
+
+## plot all NN
+plotSubgraphs(adata, subgraphs, coords_key="spatial")
+
+## plot one example of a subgraph:
+plotSpatialGraph(adata,color=["annotation_level_4"],subgraph=subgraphs[40], filter_dist=15)
+
+
+## Get the raw data
+for i in range(len(sub)):
+  node_indices = np.asarray(sub[i].node_index)
+  sub[i].raw = torch.tensor(adata.layers["counts"][node_indices].toarray(), dtype=torch.float)
+  sub[i].edge_attr = sub[i].distance.unsqueeze(1)
+
+# Example how one subgraph look like!!
+sub[1]
+```
+
+## Process all samples in a loop
+```{python}
+
+adata_combined = sc.read_h5ad(f"{r.root}/VAE_ep200.h5ad")
+reference_model=scvi.model.SCVI.load(f"{r.root}/VAE_ep250",adata_combined)
+
+
+
+## Create data into a subgraphs
+## Function for loop:
+def runfastgraph(adata, neural, status, batch_id):
+  
+  adata.layers["counts"] = adata.X
+  adata.obs["batch"]=batch[batch_id]
+  adata.X = reference_model.get_normalized_expression(adata)
+  
+  adata = BuildGraph(adata)
+  adata = barcode_mapping(adata)
+  subgraphs = getMaxSubgraphs(adata)
+  sub = BuildPYG(adata, subgraphs)
+
+  ## Get the raw data
+  for i in range(len(sub)):
+    node_indices = np.asarray(sub[i].node_index)
+    sub[i].raw = torch.tensor(adata.layers["counts"][node_indices].toarray(), dtype=torch.float)
+    sub[i].edge_attr = sub[i].distance.unsqueeze(1)
+    sub[i].neural = torch.tensor(neural, dtype=torch.long)
+    sub[i].status = torch.tensor(status, dtype=torch.long)
+    sub[i].patient_source = torch.tensor(batch[batch_id], dtype=torch.long)
+  
+  return sub
+
+
+files = r.anno_2["h5ad"].values[0:15]
+status = r.anno_2["status"].values[0:15]
+neural = r.anno_2["neural"].values[0:15]
+
+t = pd.Series(status)  
+t_cat = pd.Categorical(t)
+status_num = t_cat.codes
+
+t = pd.Series(neural)  
+t_cat = pd.Categorical(t)
+neural_num = t_cat.codes
+
+
+batch = [1,2,3,4,5,6,7,8,1,2,3,4,5,6,7,8][0:15]
+
+
+## First sample
+graph = runfastgraph(ad.read_h5ad(adatas[0]),neural_num[0],status_num[0], batch[0]).copy()
+
+## Add graphs
+for i in range(1,len(adatas)):
+  print(adatas[i])
+  gg = runfastgraph(ad.read_h5ad(adatas[i]),neural_num[i],status_num[i], batch[i]).copy()
+  graph = graph+gg
+
+len(graph)
+
+torch.save(graph, f"{r.root}/subgraphs.pt")
+sub = graph
+
+import torch
+sub = torch.load(f"{r.root}/subgraphs.pt")
+
+```
+
+
+## Process the samples for GNN (including subgraphs)
+
+## Set up prediction:
+Here we would be interested in the NN which are predictive for Neural status (neural high vs low) and the status of recurrence. This will be represented by a GNN including nodes (cells) and edges (distance). We will use a attention GNN including the attentions as outputs for XAI.
+The latent space of the GNN will be connected to two MPLs which predicht neural status and rec/prim. 
+
+Here are the architectures: 
+
+```{python}
+
+## Imports:
+from torch_geometric.nn import GATConv
+from torch_geometric.utils import softmax
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import global_mean_pool
+
+## Graph Attention Layer
+class CustomGATConv(GATConv):
+    def __init__(self, in_channels, out_channels, heads=1, concat=True, edge_dim=1, **kwargs):
+        super().__init__(in_channels, out_channels, heads=heads, concat=concat, edge_dim=edge_dim, **kwargs)
+
+    def forward(self, x, edge_index, edge_attr=None, return_attention_weights=False):
+        # Fix for edge_attr shape issue after batching
+        if edge_attr is not None and edge_attr.dim() == 2 and edge_attr.shape[1] == 1:
+            edge_attr = edge_attr.squeeze(1)
+
+        if return_attention_weights:
+            out, attn_weights = super().forward(x, edge_index, edge_attr=edge_attr, return_attention_weights=True)
+            return out, attn_weights
+        else:
+            return super().forward(x, edge_index, edge_attr=edge_attr)
+
+## Graph Encoder:
+class GraphEncoder(torch.nn.Module):
+    def __init__(self, num_features_exp, hidden_channels, edge_dim=1):
+        super(GraphEncoder, self).__init__()
+        per_head_hidden = hidden_channels // 5
+        self.conv1 = CustomGATConv(num_features_exp, per_head_hidden, heads=5, edge_dim=edge_dim)
+        self.conv2 = CustomGATConv(per_head_hidden * 5, per_head_hidden, heads=5, edge_dim=edge_dim)
+        self.bn1 = torch.nn.LayerNorm(hidden_channels)
+        self.bn2 = torch.nn.LayerNorm(hidden_channels)
+        self.dropout = torch.nn.Dropout(0.5)
+        self.merge = torch.nn.Linear(hidden_channels, hidden_channels)
+        torch.nn.init.xavier_uniform_(self.merge.weight.data)
+
+    def forward(self, x, edge_index, edge_attr, batch):
+        x, att1 = self.conv1(x, edge_index, edge_attr, return_attention_weights=True)
+        x = F.leaky_relu(x)
+        x = self.dropout(self.bn1(x))
+        x, att2 = self.conv2(x, edge_index, edge_attr, return_attention_weights=True)
+        x = F.leaky_relu(x)
+        x = self.dropout(self.bn2(x))
+        x = self.merge(x)
+        x = F.leaky_relu(x)
+        
+        ## Reduce latentspace on subgraph level
+        x_pooled = global_mean_pool(x, batch)
+
+        return x, x_pooled, att1, att2
+
+## Prediction heads: 
+class MLP(torch.nn.Module):
+    def __init__(self, hidden_channels, num_classes):
+        super(MLP, self).__init__()
+        self.model = torch.nn.Sequential(
+            torch.nn.Linear(hidden_channels, hidden_channels),
+            torch.nn.LayerNorm(hidden_channels),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(0.5),
+            torch.nn.Linear(hidden_channels, num_classes)
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.model.modules():
+            if isinstance(m, torch.nn.Linear):
+                torch.nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    torch.nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        return self.model(x)
+
+
+## if required for batch effect removal:
+
+class Discriminator(nn.Module):
+    def __init__(self, input_size, hidden_size, num_classes):
+        super(Discriminator, self).__init__()
+        self.fc1 = nn.Linear(input_size, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, num_classes)  
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+        return F.log_softmax(x, dim=1)
+
+
+# EarlyStopping:
+class EarlyStopping:
+    def __init__(self, patience=5, delta=0):
+        self.patience = patience
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.val_loss_min = float('inf')
+        self.delta = delta
+
+    def __call__(self, val_loss, model):
+        score = -val_loss
+
+        if self.best_score is None:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+        elif score < self.best_score + self.delta:
+            self.counter += 1
+            print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+            self.counter = 0
+
+    def save_checkpoint(self, val_loss, model):
+        '''Saves model when validation loss decreases.'''
+        if val_loss < self.val_loss_min:
+            self.val_loss_min = val_loss
+            # Save the model
+            torch.save(model.state_dict(), 'checkpoint.pt')
+
+```
+
+## Put the model together:
+```{python}
+
+#task1_out: Neural score
+# task2_out: Status
+
+class GraphMERFISH_MultiTask(torch.nn.Module):
+    def __init__(self, num_features_exp, hidden_channels, num_classes_task1, num_classes_task2=None, edge_dim=1):
+        super().__init__()
+        self.encoder = GraphEncoder(num_features_exp, hidden_channels, edge_dim=edge_dim)
+        self.task1_head = MLP(hidden_channels, num_classes_task1)
+        self.task2_head = MLP(hidden_channels, num_classes_task2) if num_classes_task2 else None
+
+    def forward(self, data):
+        x, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr, data.batch
+        node_latent, graph_latent, att1, att2 = self.encoder(x, edge_index, edge_attr, batch)
+        task1_out = self.task1_head(graph_latent)
+        task2_out = self.task2_head(graph_latent) if self.task2_head else None
+        return node_latent, task1_out, task2_out, att1, att2
+
+```
+
+
+
+## Training function with Discriminator:
+```{python}
+from tqdm import tqdm
+import numpy as np
+
+def train_discriminator(model, discriminator, train_loader, val_loader, criterion1, criterion2, criterion_discriminator, optimizer, optimizer_discriminator, num_epochs=50, patience=5):
+    early_stopping = EarlyStopping(patience=patience, delta=0.01)
+
+    for epoch in range(num_epochs):
+        model.train()
+        discriminator.train()
+        epoch_loss = 0
+        total_discriminator_loss = 0
+
+        for data in tqdm(train_loader):
+            # Train primary model
+            optimizer.zero_grad()
+            data.edge_attr = data.distance.view(-1, 1).float()
+            node_latent, task1_out, task2_out, att1, att2 = model(data.to(device))
+            
+            #loss status
+            neural = data.neural.long().to(device)
+            prim_loss = criterion1(task1_out, neural)
+            
+            #loss status
+            status = data.status.long().to(device)
+            sec_loss = criterion2(task2_out, status)
+            
+            loss = prim_loss+sec_loss
+            
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+
+            # Train discriminator
+            optimizer_discriminator.zero_grad()
+            patient_source = data.patient_source.long().to(device)
+            discriminator_pred = discriminator(node_latent.detach())
+            discriminator_pred = global_mean_pool(discriminator_pred, data.batch)
+            discriminator_loss = criterion_discriminator(discriminator_pred, patient_source)
+            discriminator_loss.backward()
+            optimizer_discriminator.step()
+            total_discriminator_loss += discriminator_loss.item()
+
+            # Adversarial step
+            optimizer.zero_grad()
+            node_latent, task1_out, task2_out, att1, att2 = model(data.to(device))
+            discriminator_pred = discriminator(node_latent)
+            discriminator_pred = global_mean_pool(discriminator_pred, data.batch)
+            adversarial_loss = -criterion_discriminator(discriminator_pred, patient_source)
+            adversarial_loss.backward()
+            optimizer.step()
+
+        # Validation (primary model only)
+        model.eval()
+        val_loss = 0
+        val_outputs_1 = []
+        val_outputs_2 = []
+        val_labels = []
+
+        with torch.no_grad():
+            for data in val_loader:
+                data.edge_attr = data.distance.view(-1, 1).float()
+                node_latent, task1_out, task2_out, att1, att2 = model(data.to(device))
+                val_outputs_1.append(torch.argmax(task1_out, dim=1).detach().cpu().numpy())
+                val_outputs_2.append(torch.argmax(task2_out, dim=1).detach().cpu().numpy())
+                pred_1 = data.neural.long().to(device)
+                pred_2 = data.status.long().to(device)
+                val_labels.append(pred_1.cpu().numpy())
+                val_loss += criterion1(task1_out, pred_1).item()+criterion1(task2_out, pred_2).item()
+
+        val_loss /= len(val_loader)
+        pred = np.concatenate(val_outputs_1)
+        true_labels = np.concatenate(val_labels)
+
+        # Print results
+        print("Epoch {}/{}".format(epoch + 1, num_epochs))
+        print("Train Loss: {:.4f}, Discriminator Loss: {:.4f}, Val Loss: {:.4f}".format(epoch_loss / len(train_loader), total_discriminator_loss / len(train_loader), val_loss))
+        print("Validation Accuracy:", accuracy_score(true_labels, pred))
+
+        # Early stopping
+        early_stopping(val_loss, model)
+        if early_stopping.early_stop:
+            print("Early stopping")
+            break
+
+    model.load_state_dict(torch.load('checkpoint.pt'))
+    
+
+
+```
+
+
+
+
+
+## Defien model and input data:
+```{python}
+device="cuda" if torch.cuda.is_available() else "cpu"
+# make sure all is float32
+for i in range(len(sub)):
+  sub[i].edge_attr = sub[1].edge_attr.float()
+
+
+model = GraphMERFISH_MultiTask(
+    num_features_exp=500, hidden_channels=125, 
+    num_classes_task1=2, num_classes_task2=2, 
+    edge_dim=1
+)
+
+discriminator = Discriminator(input_size=125, hidden_size=32, num_classes=9)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+optimizer_discriminator = torch.optim.Adam(discriminator.parameters(), lr=0.001)
+
+
+criterion1 = nn.CrossEntropyLoss()
+criterion2 = nn.CrossEntropyLoss()
+criterion_discriminator = nn.NLLLoss()
+
+
+
+from torch.utils.data import random_split
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
+
+## Prepare training and val data:
+data_list = sub
+train_ratio = 0.8
+val_ratio = 0.2
+train_size = int(len(data_list) * train_ratio)
+val_size = len(data_list) - train_size
+train_data, val_data = random_split(data_list, [train_size, val_size])
+
+# Create data loaders
+from torch_geometric.loader import DataLoader
+train_loader = DataLoader(train_data, batch_size=10, shuffle=False)
+val_loader = DataLoader(val_data, batch_size=10, shuffle=False)
+
+#data = next(iter(train_loader))
+#data.edge_attr = data.distance.view(-1, 1).float()
+#first_batch = next(iter(train_loader))
+#node_latent, task1_out, task2_out, att1, att2 = model(data.to(device))
+
+train_discriminator(
+    model=model,
+    discriminator=discriminator,
+    train_loader=train_loader,
+    val_loader=val_loader,
+    criterion1=nn.CrossEntropyLoss(),
+    criterion2=nn.CrossEntropyLoss(),
+    criterion_discriminator=nn.NLLLoss(),
+    optimizer=torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4),
+    optimizer_discriminator=optimizer_discriminator,
+    num_epochs=50,
+    patience=5
+)
+    
+
+plt.figure(figsize=(10, 6))
+plt.plot(results["train_losses"], label="Train Loss")
+plt.plot(results["val_losses"], label="Validation Loss")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.title("Training and Validation Loss")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+
+## Store model:
+torch.save(model, f"{r.root}/GNN_trained_27_02_2025.pt")
+
+```
+
+
+## Get the prediction for all samples and plot the rec/neural status 
+```{python}
+
+model.eval()
+val_outputs_1 = []
+val_outputs_2 = []
+val_labels1 = []
+val_labels2 = []
+logit1 = []
+logit2 = []
+
+full_data = DataLoader(sub, batch_size=10, shuffle=False)
+
+with torch.no_grad():
+  for data in full_data:
+    data.edge_attr = data.distance.view(-1, 1).float()
+    node_latent, task1_out, task2_out, att1, att2 = model(data.to(device))
+    logit1.append(task1_out.detach().cpu().numpy())
+    logit2.append(task2_out.detach().cpu().numpy())
+    val_outputs_1.append(torch.argmax(task1_out, dim=1).detach().cpu().numpy())
+    val_outputs_2.append(torch.argmax(task2_out, dim=1).detach().cpu().numpy())
+    pred_1 = data.neural.long().to(device)
+    pred_2 = data.status.long().to(device)
+    val_labels1.append(pred_1.cpu().numpy())
+    val_labels2.append(pred_2.cpu().numpy())
+
+
+pred_1_all = np.concatenate(val_outputs_1)
+pred_2_all = np.concatenate(val_outputs_2)
+label_1_all = np.concatenate(val_labels1)
+label_2_all = np.concatenate(val_labels2)
+logits_1_all = np.concatenate(logit1)
+logits_2_all = np.concatenate(logit2)
+
+## Check confusion map
+predicted = pred_2_all
+labels = label_2_all
+print("Accuracy:", accuracy_score(labels, predicted))
+print("Precision:", precision_score(labels, predicted, average='macro'))
+print("Recall:", recall_score(labels, predicted, average='macro'))
+print("F1 Score:", f1_score(labels, predicted, average='macro'))
+print("Confusion Matrix:\n", confusion_matrix(labels, predicted))
+
+cm = confusion_matrix(labels, predicted)
+import seaborn as sns
+import matplotlib.pyplot as plt
+plt.figure(figsize=(10, 8))
+sns.heatmap(cm, annot=True, fmt='g', cmap='Blues')
+plt.xlabel('Predicted')
+plt.ylabel('True')
+plt.title('Confusion Matrix: True vs Predicted')
+plt.show()
+
+```
+
+
+```{r}
+
+res = data.frame(neural = py$pred_1_all, neural_logit = py$logits_1_all, status = py$pred_2_all, status_logit = py$logits_2_all)
+
+## plot scores
+library(scales)
+ggplot(res)+
+  geom_point(mapping = aes(x=neural_logit.1 %>% rescale(., c(0,1)), 
+                           y=status_logit.1 %>% rescale(., c(0,1)),
+                           color = neural_logit.1 %>% rescale(., c(0,1))),
+             )+
+  scale_color_gradientn(colors = rev(RColorBrewer::brewer.pal(9, "RdBu")))+
+  theme_bw() +
+      theme(panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            panel.background = element_rect(colour = "black", size=0.5),
+            axis.text.x = element_text(colour="black"),
+            axis.text.y = element_text(colour="black"))+
+      coord_fixed()+
+    theme(legend.text = element_text(size=6),
+          legend.key.size = unit(0.3, "cm"),
+          legend.title = element_text(size=8))+
+    guides(color = guide_colourbar(barwidth = 0.3, barheight = 8, ticks =F, frame.colour="black"), label=F)
+
+saveRDS(res, paste0(root, "/", "prediction_res.RDS"))
+
+```
+
+
+## Get IG and Attention of the Ecosystems:
+## Compute IG values:
+
+
+```{python}
+def getXAI(model, subgraph):
+    data = subgraph
+    data.edge_attr = data.distance.view(-1, 1).float()
+    model.eval()
+    node_latent, task1_out, _, _, attention = model(data.to(device))
+    edge_index, att_weights = attention  # Unpack attention tuple
+    
+    from captum.attr import IntegratedGradients
+
+    def model_forward(x):
+        out = model.encoder(x, data.edge_index, data.edge_attr, data.batch)[1]
+        return model.task1_head(out)
+    
+    ig = IntegratedGradients(model_forward)
+    attributions, delta = ig.attribute(
+        inputs=data.x.requires_grad_(),
+        target=data.neural.item(),
+        return_convergence_delta=True
+    )
+
+    return [
+        edge_index.cpu().detach().numpy(),
+        att_weights.cpu().detach().numpy(),
+        delta.cpu().detach().numpy(),
+        attributions.cpu().detach().numpy()
+    ]
+
+
+edge_index, attention, delta, attributions = getXAI(model, sub[np.ceil(r.index).astype(int)])
+data = sub[np.ceil(r.index).astype(int)]
+
+
+```
+
+
+```{r}
+colors <- readRDS("/Users/dieterhenrikheiland/Desktop/RecurrentGBM/SingleCellRef/GBM_Neuron_colors.RDS")
+colors$annotation_level_4new <- 
+  colors$annotation_level_4 %>% 
+  str_replace_all(" ", ".") %>% 
+  str_replace_all("-", ".") %>% 
+  str_replace_all("/", ".")
+nn=colors$colors;names(nn)=colors$annotation_level_4
+
+
+index=1
+anno_2$batch = c(1,2,3,4,5,6,7,8,1,2,3,4,5,6,7,8)
+XAISubgraph <- function(index, attention=T, IG=T, att_head=5, offset = 10, pt_max = 5){
+  
+  ## Extract Information
+  reticulate::py_run_string("node_index_r = sub[np.ceil(r.index).astype(int)].node_index.cpu().detach().numpy()")
+  node_index = py$node_index_r
+  sample = c(py$sub[[index]]$patient_source$cpu()$numpy())-1
+  recurrent = if_else(py$sub[[index]]$status$cpu()$numpy()==0, "de_novo", "rec")
+  path_spata = anno_2 %>% filter(batch == as.numeric(sample)) %>% filter(status==recurrent) %>% pull(SPATA)
+  path_andata = anno_2 %>% filter(batch == as.numeric(sample) & status==recurrent) %>% pull(h5ad)
+  
+  ## Get outputs
+  object = readRDS(path_spata)
+  coords = getCoordsDf(object)
+
+  ## Subgraph 
+  subgraph = joinWith(object, features = "annotation_level_4")[node_index+1, ]
+  
+  
+  ## XAI
+  reticulate::py_run_string("edge_index, attention, delta, attributions = getXAI(model, sub[np.ceil(r.index).astype(int)])")
+  
+  edge_df = py$edge_index %>% t() %>% as.data.frame()
+  names(edge_df) <- c("from", "to")
+  edge_df$attention = py$attention[,att_head]
+  node_features = subgraph %>% mutate(IG = py$delta %>% scales::rescale(., c(0,1)))
+  
+  p= ggplot()
+  # remove self loops:
+  edge_df <- 
+    edge_df %>% 
+    mutate(self = if_else(from==to, "self", "no")) %>% 
+    filter(self!="self")
+  
+  edge_df$x_from = node_features$x[edge_df$from+1]
+  edge_df$y_from = node_features$y[edge_df$from+1]
+  edge_df$x_to = node_features$x[edge_df$to+1]
+  edge_df$y_to = node_features$y[edge_df$to+1]
+  
+  
+  ## Add cells in the sourounding
+  ranges = c(range(node_features$x), range(node_features$y))
+  all_cells = 
+    joinWith(object, features = "annotation_level_4") %>% 
+    filter(x>ranges[1]-c(offset*2) & x<ranges[2]+c(offset*2)) %>% 
+    filter(y>ranges[3]-c(offset*2) & y<ranges[4]+c(offset*2)) %>% 
+    filter(!barcodes %in% node_features$barcodes) %>% 
+    mutate(annotation_level_4 = "none", IG=NA)
+  
+  node_features <- rbind(node_features, all_cells)
+  library(ggforce)
+  p = 
+    p+
+    #geom_point(node_features %>% filter(annotation_level_4=="none"), mapping=aes(x=x, y=y), shape=21, size=4, fill="grey")+
+    geom_voronoi_tile(node_features, mapping = aes(x,y), max.radius = 10, fill="lightgrey", alpha=0.2, colour = 'black', linewidth=0.1)+
+    geom_segment(data = edge_df, mapping=aes(x=x_from, xend=x_to, y=y_from, yend=y_to, color=attention, linewidth = attention))+
+    geom_point(node_features, mapping=aes(x=x, y=y, size=IG, fill=annotation_level_4), shape=21)
+  
+    
+  p=p+
+    scale_color_gradientn(colors = viridis::inferno(50))+
+    scale_fill_manual(values=nn)+
+    scale_size(range=c(0.5,pt_max))+
+    scale_linewidth(range=c(0,1))+
+    xlim(ranges[1]-offset,ranges[2]+offset)+
+    ylim(ranges[3]-offset,ranges[4]+offset)+
+    theme_bw() +
+      theme(panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            panel.background = element_rect(colour = "black", size=0.5),
+            axis.text.x = element_text(colour="black"),
+            axis.text.y = element_text(colour="black"))+
+      coord_equal()+
+    theme(legend.text = element_text(size=6),
+          legend.key.size = unit(0.3, "cm"),
+          legend.title = element_text(size=8))+
+    guides(color = guide_colourbar(barwidth = 0.3, barheight = 8, ticks =F, frame.colour="black"), label=F)
+
+  return(list(plot=p, nodes = node_features, edges = edge_df))
+
+}
+
+index=3
+subgraph_analysis = XAISubgraph(index, attention=T, IG=T, att_head=5, offset = 10, pt_max = 10)
+subgraph_analysis[[1]]
+
+```
+
+## Get the to neural post pembro
+```{r}
+top_nh_pembro = res %>% mutate(index=1:nrow(.)) %>% filter(neural==1) %>% arrange(desc(status_logit.2), desc(neural_logit.2)) %>% head(40)
+top_nl_pembro = res %>% mutate(index=1:nrow(.)) %>% filter(neural==0) %>% arrange(desc(status_logit.2), desc(neural_logit.2)) %>% head(40)
+
+index=top_nl_pembro$index[6]
+subgraph_analysis = XAISubgraph(index, attention=T, IG=T, att_head=5, offset = 10, pt_max = 10)
+subgraph_analysis[[1]]
+
+```
+
+
+## Loop top_nh_pembro
+
+```{r}
+nh_pembro_list = list()
+for(i in 1:27){
+  index=top_nh_pembro$index[i]
+  print(i)
+  subgraph_analysis = XAISubgraph(index, attention=T, IG=T, att_head=5, offset = 10, pt_max = 10)
+  nh_pembro_list <- c(nh_pembro_list,list(subgraph_analysis))
+}
+
+
+## Create nodes file
+nh_pembro_nodes = map_dfr(1:27, .f=function(i){nh_pembro_list[[i]]$nodes %>% mutate(rank=i)})
+
+nh_pembro_nodes %>% 
+  filter(annotation_level_4!="none") %>% 
+  group_by(annotation_level_4) %>% 
+  summarise(mean_ID = mean(IG)) %>% 
+  arrange(desc(mean_ID)) %>% 
+  ungroup() %>% 
+  mutate(annotation_level_4 = factor(annotation_level_4, level = .$annotation_level_4)) %>% 
+  ggplot()+
+  geom_segment(mapping=aes(x=annotation_level_4, xend=annotation_level_4, y=0, yend=mean_ID))+
+  geom_point(mapping=aes(x=annotation_level_4, y=mean_ID, size=mean_ID, fill=annotation_level_4), shape=21)+
+  scale_fill_manual(values=nn)+
+  theme_bw() +
+      theme(panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            panel.background = element_rect(colour = "black", size=0.5),
+            axis.text.x = element_text(colour="black", angle=90, hjust=1),
+            axis.text.y = element_text(colour="black"))+
+  Seurat::NoLegend()
+
+
+```
+
+
+## Loop top_nl_pembro
+
+```{r}
+nl_pembro_list = list()
+for(i in 1:40){
+  index=top_nl_pembro$index[i]
+  subgraph_analysis = XAISubgraph(index, attention=T, IG=T, att_head=5, offset = 10, pt_max = 10)
+  nl_pembro_list <- c(nl_pembro_list,list(subgraph_analysis))
+}
+
+
+## Create nodes file
+nl_pembro_nodes = map_dfr(1:40, .f=function(i){nl_pembro_list[[i]]$nodes %>% mutate(rank=i)})
+
+nl_pembro_nodes %>% 
+  filter(annotation_level_4!="none") %>% 
+  group_by(annotation_level_4) %>% 
+  summarise(mean_ID = mean(IG)) %>% 
+  arrange(desc(mean_ID)) %>% 
+  ungroup() %>% 
+  mutate(annotation_level_4 = factor(annotation_level_4, level = .$annotation_level_4)) %>% 
+  ggplot()+
+  geom_segment(mapping=aes(x=annotation_level_4, xend=annotation_level_4, y=0, yend=mean_ID))+
+  geom_point(mapping=aes(x=annotation_level_4, y=mean_ID, size=mean_ID, fill=annotation_level_4), shape=21)+
+  scale_fill_manual(values=nn)+
+  theme_bw() +
+      theme(panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            panel.background = element_rect(colour = "black", size=0.5),
+            axis.text.x = element_text(colour="black", angle=90, hjust=1),
+            axis.text.y = element_text(colour="black"))+
+  Seurat::NoLegend()
+
+
+```
+
+## Compare
+```{r}
+nl <- 
+  nl_pembro_nodes %>% 
+  filter(annotation_level_4!="none") %>% 
+  group_by(annotation_level_4) %>% 
+  summarise(mean_ID_nl = mean(IG)) %>% 
+  arrange(desc(mean_ID_nl)) %>% 
+  ungroup() %>% 
+  mutate(annotation_level_4 = factor(annotation_level_4, level = .$annotation_level_4))
+
+nh <- 
+  nh_pembro_nodes %>% 
+  filter(annotation_level_4!="none") %>% 
+  group_by(annotation_level_4) %>% 
+  summarise(mean_ID_nh = mean(IG)) %>% 
+  arrange(desc(mean_ID_nh)) %>% 
+  ungroup() %>% 
+  mutate(annotation_level_4 = factor(annotation_level_4, level = .$annotation_level_4))
+
+
+compare = 
+  left_join(nl, nh) %>% 
+  mutate(diff = mean_ID_nl-mean_ID_nh) %>% 
+  arrange(desc(diff)) %>% 
+  ungroup() %>% 
+  mutate(annotation_level_4 = factor(annotation_level_4, level = .$annotation_level_4))
+
+ggplot(compare)+
+  geom_segment(mapping=aes(x=annotation_level_4, xend=annotation_level_4, y=0, yend=diff))+
+  geom_point(mapping=aes(x=annotation_level_4, y=diff, size=abs(diff), fill=annotation_level_4), shape=21)+
+  scale_fill_manual(values=nn)+
+  theme_bw() +
+      theme(panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            panel.background = element_rect(colour = "black", size=0.5),
+            axis.text.x = element_text(colour="black", angle=90, hjust=1),
+            axis.text.y = element_text(colour="black"))+
+  Seurat::NoLegend()
+
+
+```
+
+
+## Attention based Cell-Cell Interactions:
+
+```{r}
+## Neural low
+nl_pembro_nodes = map(1:40, .f=function(i){nl_pembro_list[[i]]$nodes %>% mutate(rank=i)})
+nl_pembro_edges = map_dfr(1:40, .f=function(i){
+  edges = nl_pembro_list[[i]]$edges %>% mutate(rank=i)
+  edges$from_cells = nl_pembro_nodes[[i]]$annotation_level_4[edges$from+1]
+  edges$to_cells = nl_pembro_nodes[[i]]$annotation_level_4[edges$to+1]
+  edges <- edges %>% select(from_cells, to_cells, attention, rank)
+  return(edges)
+  })
+
+nl_pembro_edges <- 
+  nl_pembro_edges %>% 
+  group_by(from_cells, to_cells) %>% 
+  summarise(attention = mean(attention)) %>% 
+  mutate(self = if_else(from_cells==to_cells, "self", "no")) %>% 
+  filter(self!="self")
+
+
+df_net <- nl_pembro_edges[,c("from_cells", "to_cells", "attention")]
+df_net <- df_net %>% filter(attention>0.55)
+#df$weight <- scales::rescale(df$weight, c(0,1))
+df_net$attention <- df_net$attention^5
+names(df_net) <- c("from", "to", "weight")
+
+
+colors <- readRDS("/Users/dieterhenrikheiland/Desktop/RecurrentGBM/SingleCellRef/GBM_Neuron_colors.RDS")
+colors$annotation_level_4new <- 
+  colors$annotation_level_4 %>% 
+  str_replace_all(" ", ".") %>% 
+  str_replace_all("-", ".") %>% 
+  str_replace_all("/", ".")
+nn=colors$colors;names(nn)=colors$annotation_level_4new
+
+df_net$from <- df_net$from %>% 
+  str_replace_all(" ", ".") %>% 
+  str_replace_all("-", ".") %>% 
+  str_replace_all("/", ".")
+
+df_net$to <- df_net$to %>% 
+  str_replace_all(" ", ".") %>% 
+  str_replace_all("-", ".") %>% 
+  str_replace_all("/", ".")
+
+library(igraph)
+graph <- igraph::graph_from_data_frame(df_net, directed=T)
+E(graph)$magnitude <- df_net$weight
+E(graph)$color <- df_net$to %>% as.character()
+type <- c(df_net$from%>% as.character(), df_net$to %>% as.character()) %>% unique()
+V(graph)$type <- type 
+
+V(graph)$type
+library(ggraph)
+library(ggrepel)
+ggraph(graph, layout = 'linear', circular = TRUE)+
+  geom_edge_arc2(aes(width=magnitude, alpha=magnitude, edge_color = color))+
+  geom_node_point(aes(color=type), size=8)+
+  coord_fixed()+
+  theme_void()+
+  scale_color_manual(values=nn)+
+  scale_edge_color_manual(values=nn)+
+  geom_text_repel(aes(x=x, y=y,label=type %>% str_replace_all(., "[.]", " ")), size=3)+
+  Seurat::NoLegend()
+
+## Neural high
+nh_pembro_nodes = map(1:27, .f=function(i){nh_pembro_list[[i]]$nodes %>% mutate(rank=i)})
+nh_pembro_edges = map_dfr(1:27, .f=function(i){
+  edges = nh_pembro_list[[i]]$edges %>% mutate(rank=i)
+  edges$from_cells = nh_pembro_nodes[[i]]$annotation_level_4[edges$from+1]
+  edges$to_cells = nh_pembro_nodes[[i]]$annotation_level_4[edges$to+1]
+  edges <- edges %>% select(from_cells, to_cells, attention, rank)
+  return(edges)
+  })
+
+nh_pembro_edges <- 
+  nh_pembro_edges %>% 
+  group_by(from_cells, to_cells) %>% 
+  summarise(attention = mean(attention)) %>% 
+  mutate(self = if_else(from_cells==to_cells, "self", "no")) %>% 
+  filter(self!="self")
+
+
+df_net <- nh_pembro_edges[,c("from_cells", "to_cells", "attention")]
+df_net <- df_net %>% filter(attention>0.8)
+#df$weight <- scales::rescale(df$weight, c(0,1))
+df_net$attention <- df_net$attention^5
+names(df_net) <- c("from", "to", "weight")
+df_net$from <- df_net$from %>% 
+  str_replace_all(" ", ".") %>% 
+  str_replace_all("-", ".") %>% 
+  str_replace_all("/", ".")
+
+df_net$to <- df_net$to %>% 
+  str_replace_all(" ", ".") %>% 
+  str_replace_all("-", ".") %>% 
+  str_replace_all("/", ".")
+library(igraph)
+graph <- igraph::graph_from_data_frame(df_net, directed=T)
+E(graph)$magnitude <- df_net$weight
+E(graph)$color <- df_net$to %>% as.character()
+type <- c(df_net$from%>% as.character(), df_net$to %>% as.character()) %>% unique()
+V(graph)$type <- type 
+
+V(graph)$type
+library(ggraph)
+library(ggrepel)
+ggraph(graph, layout = 'linear', circular = TRUE)+
+  geom_edge_arc2(aes(width=magnitude, alpha=magnitude, edge_color = color))+
+  geom_node_point(aes(color=type), size=8)+
+  coord_fixed()+
+  theme_void()+
+  scale_color_manual(values=nn)+
+  scale_edge_color_manual(values=nn)+
+  geom_text_repel(aes(x=x, y=y,label=type %>% str_replace_all(., "[.]", " ")), size=3)+
+  Seurat::NoLegend()
+```
+
+
+# Network and NN Analysis 
+## Functions:
+```{r}
+## With SPATA inputs
+
+createNNGraph <- function(object, threshold=20){
+    
+    library(deldir)
+    library(igraph)
+    df <- getCoordsDf(object)
+    triangulation <- deldir(df$x, df$y)
+
+    net_df <- 
+        data.frame(from=df$barcodes[triangulation$delsgs$ind1],
+                    to=df$barcodes[triangulation$delsgs$ind2])
+
+    ### Remove connection with long distance
+    net_df$x1 <- df$x[match(net_df$from, df$barcodes)]
+    net_df$y1 <- df$y[match(net_df$from, df$barcodes)]
+    net_df$x2 <- df$x[match(net_df$to, df$barcodes)]
+    net_df$y2 <- df$y[match(net_df$to, df$barcodes)]
+    
+
+    net_df$dist <- sqrt((net_df$x2-net_df$x1)^2 + (net_df$y2-net_df$y1)^2)
+    dist_threshold= c(net_df$dist %>% mean())+threshold
+    net_df <- net_df %>% filter(!dist>dist_threshold)
+
+    net <- igraph::graph_from_data_frame(net_df[,c("from", "to")])
+    V(net)$x <- df$x[match(V(net)$name, df$barcodes)]
+    V(net)$y <- df$y[match(V(net)$name, df$barcodes)]
+    E(net)$dist <- net_df$dist
+    
+    return(net)
+    
+    
+}
+getNN <- function(df,graph, hop, cell){
+  first_order_subgraph <- induced_subgraph(graph, unlist(ego(graph, order = hop, nodes = cell)))
+  df_out <- first_order_subgraph %>% igraph::get.data.frame()
+  NN_cells <- data.frame(cells = unique(c(df_out$from, df_out$to))) %>% left_join(.,df, by="cells")
+  return(NN_cells)
+}
+plotVoronoi <- function(object, 
+                        color_by, 
+                        max.radius=10, 
+                        linewidth=0.1, 
+                        colour_lines="black"){
+  
+  cell_types <- plotSurface(object, color_by = color_by)$data
+  library(ggforce)
+  ggplot(cell_types, aes(x, y, group = -1L)) +
+      geom_voronoi_tile(aes(fill = .data[[color_by]]), max.radius = max.radius, colour = colour_lines, linewidth=linewidth)+
+      #scale_fill_manual(values=cc)+
+      theme_bw() +
+      theme(panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            panel.background = element_rect(colour = "black", size=0.5),
+            axis.text.x = element_text(colour="black"),
+            axis.text.y = element_text(colour="black"))+
+      coord_fixed()+
+    theme(legend.text = element_text(size=6),
+          legend.key.size = unit(0.3, "cm"),
+          legend.title = element_text(size=8))+
+    #SPATA2::ggpLayerAxesSI(object)+
+    xlab("Dimension x-space [cm]")+
+    ylab("Dimension y-space [cm]")
+}
+
+
+
+## Plot Expression
+color = colorRampPalette(c("#FFFFFF", RColorBrewer::brewer.pal(9, "Reds")))(50)
+plotVoronoi(obj_pre, color_by = "CD3D")+
+  scale_fill_gradientn(colors = color)
+
+
+```
+
+## Analysis Neural High:
+```{r}
+
+## Neural high
+sample_name = "R6"
+obj_pre <- readRDS(paste0(root, "/", sample_name, "_spata_obj_preOP.RDS"))
+obj_post <- readRDS(paste0(root, "/", sample_name, "_spata_obj_postOP.RDS"))
+
+## Plot Cell Types
+colors <- readRDS("/Users/dieterhenrikheiland/Desktop/RecurrentGBM/SingleCellRef/GBM_Neuron_colors.RDS")
+colors$annotation_level_4new <- 
+  colors$annotation_level_4 %>% 
+  str_replace_all(" ", "_") %>% 
+  str_replace_all("-", "_") %>% 
+  str_replace_all("/", "_")
+
+
+## Get names of celltypes and reference color aligned
+obj_pre@fdata[[1]]$annotation_level_4 <- 
+  obj_pre@fdata[[1]]$annotation_level_4 %>% 
+  str_replace_all(" ", "_") %>% 
+  str_replace_all("-", "_") %>% 
+  str_replace_all("/", "_")
+obj_pre@fdata[[1]]$annotation_level_4 <- factor(obj_pre@fdata[[1]]$annotation_level_4, level=colors$annotation_level_4new)
+
+
+cc <- colors$colors;names(cc) <- colors$annotation_level_4new
+
+plotVoronoi(obj_pre, color_by = "annotation_level_4")+
+  scale_fill_manual(values = cc)
+
+
+## Get names of celltypes and reference color aligned
+obj_post@fdata[[1]]$annotation_level_4 <- 
+  obj_post@fdata[[1]]$annotation_level_4 %>% 
+  str_replace_all(" ", "_") %>% 
+  str_replace_all("-", "_") %>% 
+  str_replace_all("/", "_")
+obj_post@fdata[[1]]$annotation_level_4 <- factor(obj_post@fdata[[1]]$annotation_level_4, level=colors$annotation_level_4new)
+
+
+cc <- colors$colors;names(cc) <- colors$annotation_level_4new
+plotVoronoi(obj_post, color_by = "annotation_level_4")+
+  scale_fill_manual(values = cc)
+
+
+## NN Analysis:
+
+## Get T cell NN
+## PreOP
+graph = createNNGraph(obj_pre)
+df <- SPATA2::getFeatureDf(obj_pre) %>% as.data.frame()
+lymphoid = colors[colors$annotation_level_2 %in% c("CD8.Tcells", "CD4.Tcells", "Lymphoid"), ] %>% pull(annotation_level_4new)
+
+## filter cells that are in the graph
+nodes <- igraph::as_data_frame(graph, what = "vertices")
+cells <- df %>% filter(annotation_level_4 %in% lymphoid) %>% filter(barcodes %in% nodes$name)
+
+listofB_NN <- map_dfr(1:length(cells$barcodes), .f=function(ii){
+  first_order_subgraph <- induced_subgraph(graph, unlist(ego(graph, order = 1, nodes = cells$barcodes[ii])))
+  df <- first_order_subgraph %>% igraph::get.data.frame() %>%  mutate(NN=ii)
+  NN_cells <- data.frame(cells = unique(c(df$from, df$to)), NN=ii)
+  
+}, .progress=T)
+names(listofB_NN)[1] <- "barcodes"
+
+Tcell_NN <- 
+  left_join(listofB_NN, df %>% select(barcodes, annotation_level_4), by="barcodes") %>% 
+  filter(!annotation_level_4 %in% lymphoid)
+
+
+input<- 
+  Tcell_NN %>% 
+  group_by(annotation_level_4) %>% 
+  count() %>% 
+  ungroup() %>% 
+  mutate(from="Tcells", to = annotation_level_4, weight=n) %>% 
+  as.data.frame()
+
+
+df_net <- input[,c("from", "to", "weight")]
+df_net <- df_net %>% filter(weight>500)
+#df$weight <- scales::rescale(df$weight, c(0,1))
+df_net$weight <- df_net$weight^5
+graph <- igraph::graph_from_data_frame(df_net, directed=T)
+E(graph)$magnitude <- df_net$weight
+E(graph)$color <- df_net$to %>% as.character()
+type <- c(df_net$from, df_net$to %>% as.character()) %>% unique()
+V(graph)$type <- type 
+
+V(graph)$type
+library(ggraph)
+library(ggrepel)
+ggraph(graph, layout = 'linear', circular = TRUE)+
+  geom_edge_arc2(aes(width=magnitude, alpha=magnitude, edge_color = color))+
+  geom_node_point(aes(color=type), size=8)+
+  coord_fixed()+
+  theme_classic()+
+  scale_color_manual(values=cc)+
+  scale_edge_color_manual(values=cc)+
+  geom_text_repel(aes(x=x, y=y,label=type %>% str_replace_all(., "[.]", " ")), size=3)+
+  Seurat::NoLegend()
+
+
+## PostOP
+graph = createNNGraph(obj_post)
+df <- SPATA2::getFeatureDf(obj_post) %>% as.data.frame()
+lymphoid = colors[colors$annotation_level_2 %in% c("CD8.Tcells", "CD4.Tcells", "Lymphoid"), ] %>% pull(annotation_level_4new)
+
+## filter cells that are in the graph
+nodes <- igraph::as_data_frame(graph, what = "vertices")
+cells <- df %>% filter(annotation_level_4 %in% lymphoid) %>% filter(barcodes %in% nodes$name)
+
+listofB_NN <- map_dfr(1:length(cells$barcodes), .f=function(ii){
+  first_order_subgraph <- induced_subgraph(graph, unlist(ego(graph, order = 1, nodes = cells$barcodes[ii])))
+  df <- first_order_subgraph %>% igraph::get.data.frame() %>%  mutate(NN=ii)
+  NN_cells <- data.frame(cells = unique(c(df$from, df$to)), NN=ii)
+  
+}, .progress=T)
+names(listofB_NN)[1] <- "barcodes"
+
+Tcell_NN <- 
+  left_join(listofB_NN, df %>% select(barcodes, annotation_level_4), by="barcodes") %>% 
+  filter(!annotation_level_4 %in% lymphoid)
+
+
+input<- 
+  Tcell_NN %>% 
+  group_by(annotation_level_4) %>% 
+  count() %>% 
+  ungroup() %>% 
+  mutate(from="Tcells", to = annotation_level_4, weight=n) %>% 
+  as.data.frame()
+
+
+df_net <- input[,c("from", "to", "weight")]
+df_net <- df_net %>% filter(weight>10)
+#df$weight <- scales::rescale(df$weight, c(0,1))
+df_net$weight <- df_net$weight^5
+graph <- igraph::graph_from_data_frame(df_net, directed=T)
+E(graph)$magnitude <- df_net$weight
+E(graph)$color <- df_net$to %>% as.character()
+type <- c(df_net$from, df_net$to %>% as.character()) %>% unique()
+V(graph)$type <- type 
+
+V(graph)$type
+library(ggraph)
+library(ggrepel)
+ggraph(graph, layout = 'linear', circular = TRUE)+
+  geom_edge_arc2(aes(width=magnitude, alpha=magnitude, edge_color = color))+
+  geom_node_point(aes(color=type), size=8)+
+  coord_fixed()+
+  theme_classic()+
+  scale_color_manual(values=cc)+
+  scale_edge_color_manual(values=cc)+
+  geom_text_repel(aes(x=x, y=y,label=type %>% str_replace_all(., "[.]", " ")), size=3)+
+  Seurat::NoLegend()
+
+
+
+
+
+```
+
+
+# Analysis Neural low
+```{r}
+
+## Neural low
+sample_name = "R5"
+obj_pre <- readRDS(paste0(root, "/", sample_name, "_spata_obj_preOP.RDS"))
+obj_post <- readRDS(paste0(root, "/", sample_name, "_spata_obj_postOP.RDS"))
+
+
+## Plot Cell Types
+colors <- readRDS("/Users/dieterhenrikheiland/Desktop/RecurrentGBM/SingleCellRef/GBM_Neuron_colors.RDS")
+colors$annotation_level_4new <- 
+  colors$annotation_level_4 %>% 
+  str_replace_all(" ", "_") %>% 
+  str_replace_all("-", "_") %>% 
+  str_replace_all("/", "_")
+
+
+## Get names of celltypes and reference color aligned
+obj_pre@fdata[[1]]$annotation_level_4 <- 
+  obj_pre@fdata[[1]]$annotation_level_4 %>% 
+  str_replace_all(" ", "_") %>% 
+  str_replace_all("-", "_") %>% 
+  str_replace_all("/", "_")
+obj_pre@fdata[[1]]$annotation_level_4 <- factor(obj_pre@fdata[[1]]$annotation_level_4, level=colors$annotation_level_4new)
+
+
+cc <- colors$colors;names(cc) <- colors$annotation_level_4new
+
+plotVoronoi(obj_pre, color_by = "annotation_level_4")+
+  scale_fill_manual(values = cc)
+
+
+## Get names of celltypes and reference color aligned
+obj_post@fdata[[1]]$annotation_level_4 <- 
+  obj_post@fdata[[1]]$annotation_level_4 %>% 
+  str_replace_all(" ", "_") %>% 
+  str_replace_all("-", "_") %>% 
+  str_replace_all("/", "_")
+obj_post@fdata[[1]]$annotation_level_4 <- factor(obj_post@fdata[[1]]$annotation_level_4, level=colors$annotation_level_4new)
+
+
+cc <- colors$colors;names(cc) <- colors$annotation_level_4new
+plotVoronoi(obj_post, color_by = "annotation_level_4")+
+  scale_fill_manual(values = cc)
+
+
+## Get T cell NN
+## PreOP
+graph = createNNGraph(obj_pre)
+df <- SPATA2::getFeatureDf(obj_pre) %>% as.data.frame()
+lymphoid = colors[colors$annotation_level_2 %in% c("CD8.Tcells", "CD4.Tcells", "Lymphoid"), ] %>% pull(annotation_level_4new)
+
+## filter cells that are in the graph
+nodes <- igraph::as_data_frame(graph, what = "vertices")
+cells <- df %>% filter(annotation_level_4 %in% lymphoid) %>% filter(barcodes %in% nodes$name)
+
+listofB_NN <- map_dfr(1:length(cells$barcodes), .f=function(ii){
+  first_order_subgraph <- induced_subgraph(graph, unlist(ego(graph, order = 1, nodes = cells$barcodes[ii])))
+  df <- first_order_subgraph %>% igraph::get.data.frame() %>%  mutate(NN=ii)
+  NN_cells <- data.frame(cells = unique(c(df$from, df$to)), NN=ii)
+  
+}, .progress=T)
+names(listofB_NN)[1] <- "barcodes"
+
+Tcell_NN <- 
+  left_join(listofB_NN, df %>% select(barcodes, annotation_level_4), by="barcodes") %>% 
+  filter(!annotation_level_4 %in% lymphoid)
+
+
+input<- 
+  Tcell_NN %>% 
+  group_by(annotation_level_4) %>% 
+  count() %>% 
+  ungroup() %>% 
+  mutate(from="Tcells", to = annotation_level_4, weight=n) %>% 
+  as.data.frame()
+
+
+df_net <- input[,c("from", "to", "weight")]
+df_net <- df_net %>% filter(weight>700)
+#df$weight <- scales::rescale(df$weight, c(0,1))
+df_net$weight <- df_net$weight^5
+graph <- igraph::graph_from_data_frame(df_net, directed=T)
+E(graph)$magnitude <- df_net$weight
+E(graph)$color <- df_net$to %>% as.character()
+type <- c(df_net$from, df_net$to %>% as.character()) %>% unique()
+V(graph)$type <- type 
+
+V(graph)$type
+library(ggraph)
+library(ggrepel)
+ggraph(graph, layout = 'linear', circular = TRUE)+
+  geom_edge_arc2(aes(width=magnitude, alpha=magnitude, edge_color = color))+
+  geom_node_point(aes(color=type), size=8)+
+  coord_fixed()+
+  theme_classic()+
+  scale_color_manual(values=cc)+
+  scale_edge_color_manual(values=cc)+
+  geom_text_repel(aes(x=x, y=y,label=type %>% str_replace_all(., "[.]", " ")), size=3)+
+  Seurat::NoLegend()
+
+
+## PostOP
+graph = createNNGraph(obj_post)
+df <- SPATA2::getFeatureDf(obj_post) %>% as.data.frame()
+lymphoid = colors[colors$annotation_level_2 %in% c("CD8.Tcells", "CD4.Tcells", "Lymphoid"), ] %>% pull(annotation_level_4new)
+
+## filter cells that are in the graph
+nodes <- igraph::as_data_frame(graph, what = "vertices")
+cells <- df %>% filter(annotation_level_4 %in% lymphoid) %>% filter(barcodes %in% nodes$name)
+
+listofB_NN <- map_dfr(1:length(cells$barcodes), .f=function(ii){
+  first_order_subgraph <- induced_subgraph(graph, unlist(ego(graph, order = 1, nodes = cells$barcodes[ii])))
+  df <- first_order_subgraph %>% igraph::get.data.frame() %>%  mutate(NN=ii)
+  NN_cells <- data.frame(cells = unique(c(df$from, df$to)), NN=ii)
+  
+}, .progress=T)
+names(listofB_NN)[1] <- "barcodes"
+
+Tcell_NN <- 
+  left_join(listofB_NN, df %>% select(barcodes, annotation_level_4), by="barcodes") %>% 
+  filter(!annotation_level_4 %in% lymphoid)
+
+
+input<- 
+  Tcell_NN %>% 
+  group_by(annotation_level_4) %>% 
+  count() %>% 
+  ungroup() %>% 
+  mutate(from="Tcells", to = annotation_level_4, weight=n) %>% 
+  as.data.frame()
+
+
+df_net <- input[,c("from", "to", "weight")]
+df_net <- df_net %>% filter(weight>50)
+#df$weight <- scales::rescale(df$weight, c(0,1))
+df_net$weight <- df_net$weight^5
+graph <- igraph::graph_from_data_frame(df_net, directed=T)
+E(graph)$magnitude <- df_net$weight
+E(graph)$color <- df_net$to %>% as.character()
+type <- c(df_net$from, df_net$to %>% as.character()) %>% unique()
+V(graph)$type <- type 
+
+V(graph)$type
+library(ggraph)
+library(ggrepel)
+ggraph(graph, layout = 'linear', circular = TRUE)+
+  geom_edge_arc2(aes(width=magnitude, alpha=magnitude, edge_color = color))+
+  geom_node_point(aes(color=type), size=8)+
+  coord_fixed()+
+  theme_classic()+
+  scale_color_manual(values=cc)+
+  scale_edge_color_manual(values=cc)+
+  geom_text_repel(aes(x=x, y=y,label=type %>% str_replace_all(., "[.]", " ")), size=3)+
+  Seurat::NoLegend()
+
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
